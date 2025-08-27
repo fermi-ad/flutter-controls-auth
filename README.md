@@ -9,7 +9,7 @@ TODO: List what your package can do. Maybe include images, gifs, or videos.
 ```yaml
 dependencies:
   git:
-    uri: git@github.com:fermi-ad/flutter-controls-auth.git
+    url: https://github.com/fermi-ad/flutter-controls-auth.git
     ref: main
 ```
 
