@@ -14,6 +14,8 @@ import 'src/openid_io.dart'
 
 import 'dart:developer' as dev;
 
+export 'package:openid_client/openid_client.dart' show Credential, UserInfo;
+
 /// Defines a set of of scopes (or "roles").
 typedef ScopeList = List<String>;
 
