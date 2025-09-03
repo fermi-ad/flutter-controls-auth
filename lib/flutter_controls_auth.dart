@@ -28,9 +28,9 @@ class AuthInfo {
   final List<String> scopes;
 
   const AuthInfo({
-    this.realm = "acsys",
-    required this.clientId,
-    required this.clientSecret,
+    this.realm = "acnetconsole",
+    this.clientId = "flutter-client",
+    this.clientSecret = "cJVgClqTqpRiw7xATJQ1eVVs2LHW0Ug1",
     this.scopes = const [],
   });
 }

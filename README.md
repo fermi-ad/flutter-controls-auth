@@ -2,7 +2,7 @@
 
 ## Features
 
-TODO: List what your package can do. Maybe include images, gifs, or videos.
+- Provides a widget that manages authorization details
 
 ## Getting started
 
@@ -15,12 +15,11 @@ dependencies:
 
 ## Usage
 
-TODO: Include short and useful examples for package users. Add longer examples
-to `/example` folder.
+Applications authors won't, typically, use this package because it is used
+by our core framework. However, if one was developing a standalone, Dart
+program, this package may come in handy.
 
-```dart
-const like = 'sample';
-```
+TODO: We need to show how to use it in a Dart program.
 
 ## Additional information
 
