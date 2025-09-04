@@ -8,9 +8,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:openid_client/openid_client.dart';
-import 'src/openid_io.dart'
-    if (dart.library.html) 'src/openid_browser.dart'
-    as oid;
+import 'src/openid_browser.dart' as oid;
 
 import 'dart:developer' as dev;
 
