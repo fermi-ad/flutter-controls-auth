@@ -6,9 +6,10 @@ library;
 
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:openid_client/openid_client.dart';
-import 'src/openid_browser.dart' as oid;
+import 'src/openid_browser.dart' if (kIsWeb) 'src/openid_web.dart' as oid;
 
 import 'dart:developer' as dev;
 
