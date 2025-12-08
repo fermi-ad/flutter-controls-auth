@@ -4,6 +4,7 @@
 /// widgets and types are used by our other packages.
 library;
 
+import 'dart:convert';
 import 'dart:async';
 
 import 'package:flutter/material.dart';
@@ -70,12 +71,44 @@ Future<void> initAuth(AuthInfo ai) async {
   _credentials = await oid.getRedirectResult(client, scopes: ai.scopes);
 }
 
+String _base64UrlDecode(String base64Url) {
+  String normalized = base64Url
+      .replaceAll('-', '+') // Convert URL-safe characters back
+      .replaceAll('_', '/');
+
+  switch (normalized.length % 4) {
+    case 2:
+      normalized += '==';
+    case 3:
+      normalized += '=';
+  }
+
+  return utf8.decode(base64Decode(normalized));
+}
+
+Set<String>? extractRolesFromJwt(String? jwt) {
+  try {
+    if (jwt?.split('.') case [_, final payloadBase64Url, _]) {
+      final dec = jsonDecode(_base64UrlDecode(payloadBase64Url));
+
+      if (dec case {'realm_access': {'roles': final List rolesList}}) {
+        return rolesList.map((v) => v.toString()).toSet();
+      }
+    }
+  } catch (_) {}
+  return null;
+}
+
 class _AuthCredentials extends InheritedWidget {
   final Credential? credentials;
   final UserInfo? userInfo;
+  final Set<String>? _roles;
 
   _AuthCredentials({this.userInfo, required super.child})
-    : credentials = _credentials;
+    : credentials = _credentials,
+      _roles = extractRolesFromJwt(
+        _credentials?.idToken.toCompactSerialization(),
+      );
 
   @override
   bool updateShouldNotify(covariant _AuthCredentials oldWidget) =>
@@ -109,6 +142,13 @@ class AuthService extends StatefulWidget {
       ?.credentials
       ?.idToken
       .toCompactSerialization();
+
+  static bool inRole(BuildContext context, String name) =>
+      context
+          .dependOnInheritedWidgetOfExactType<_AuthCredentials>()
+          ?._roles
+          ?.contains(name) ??
+      false;
 
   static UserInfo? getUserInfo(BuildContext context) =>
       context.dependOnInheritedWidgetOfExactType<_AuthCredentials>()?.userInfo;
