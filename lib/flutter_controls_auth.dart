@@ -126,7 +126,7 @@ Set<String> extractRolesFromJwt(String? jwt) {
 class _AuthCredentials extends InheritedWidget {
   final Credential? credentials;
   final UserInfo? userInfo;
-  final Set<String>? _roles;
+  final Set<String> _roles;
 
   _AuthCredentials({this.userInfo, required super.child})
     : credentials = _credentials,
@@ -171,7 +171,7 @@ class AuthService extends StatefulWidget {
       context
           .dependOnInheritedWidgetOfExactType<_AuthCredentials>()
           ?._roles
-          ?.contains(name) ??
+          .contains(name) ??
       false;
 
   static UserInfo? getUserInfo(BuildContext context) =>
