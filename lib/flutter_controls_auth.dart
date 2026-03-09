@@ -25,12 +25,10 @@ typedef ScopeList = List<String>;
 class AuthInfo {
   final String realm;
   final String clientId;
-  final List<String> scopes;
 
   const AuthInfo({
     this.realm = "acnetconsole",
     this.clientId = "flutter-client",
-    this.scopes = const [],
   });
 }
 
@@ -45,6 +43,7 @@ String? _clientId;
 Future<void> initAuth(AuthInfo ai) async {
   final uri = Uri.parse('https://ad-auth.fnal.gov/realms/${ai.realm}/');
   const Duration tmo = Duration(seconds: 2);
+  const List<String> scopes = ["roles"];
 
   _authRequired = true;
   _clientId = ai.clientId;
@@ -55,16 +54,17 @@ Future<void> initAuth(AuthInfo ai) async {
   _authenticate = () async {
     if (_credentials == null) {
       try {
-        return oid.authenticate(client, scopes: ai.scopes).timeout(tmo);
+        return oid.authenticate(client, scopes: scopes).timeout(tmo);
       } on TimeoutException {
         dev.log('timeout communicating with KeyCloak', name: "auth");
         return null;
       }
+    } else {
+      return _credentials;
     }
-    return _credentials;
   };
 
-  _credentials = await oid.getRedirectResult(client, scopes: ai.scopes);
+  _credentials = await oid.getRedirectResult(client, scopes: scopes);
 }
 
 String _base64UrlDecode(String base64Url) {
@@ -102,6 +102,8 @@ Set<String> extractRolesFromJwt(String? jwt) {
 
       final dec = jsonDecode(_base64UrlDecode(payloadBase64Url));
 
+      dev.log("decoded JWT: $dec", name: "auth");
+
       // If the client ID isn't defined, there are no client-specific roles to
       // extract.
 
@@ -132,7 +134,9 @@ class _AuthCredentials extends InheritedWidget {
     : credentials = _credentials,
       _roles = extractRolesFromJwt(
         _credentials?.idToken.toCompactSerialization(),
-      );
+      ) {
+    dev.log("roles: ${_roles.join(', ')}", name: "auth");
+  }
 
   @override
   bool updateShouldNotify(covariant _AuthCredentials oldWidget) =>
