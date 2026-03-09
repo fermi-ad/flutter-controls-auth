@@ -40,12 +40,14 @@ class AuthInfo {
 Credential? _credentials;
 Future<Credential?> Function() _authenticate = () async => null;
 bool _authRequired = false;
+String? _clientId;
 
 Future<void> initAuth(AuthInfo ai) async {
   final uri = Uri.parse('https://ad-auth.fnal.gov/realms/${ai.realm}/');
   const Duration tmo = Duration(seconds: 2);
 
   _authRequired = true;
+  _clientId = ai.clientId;
 
   final issuer = await Issuer.discover(uri).timeout(tmo);
   final Client client = Client(issuer, ai.clientId);
@@ -80,17 +82,45 @@ String _base64UrlDecode(String base64Url) {
   return utf8.decode(base64Decode(normalized));
 }
 
-Set<String>? extractRolesFromJwt(String? jwt) {
+// Extracts the roles from the JWT. Although the application has access to the
+// JWT, the app shouldn't have to know how to properly extract the roles. This
+// function pulls the roles defined for the entire realm and for the current
+// application.
+
+Set<String> extractRolesFromJwt(String? jwt) {
+  // Initialize the set of roles.
+
+  final Set<String> roles = {};
+
   try {
+    // The JWT is made up of three fields separated by periods. This
+    // conditional checks that the JWT is well-formed and extracts the payload,
+    // which is the second field.
+
     if (jwt?.split('.') case [_, final payloadBase64Url, _]) {
+      // The payload is a base64url-encoded JSON string.
+
       final dec = jsonDecode(_base64UrlDecode(payloadBase64Url));
 
+      // If the client ID isn't defined, there are no client-specific roles to
+      // extract.
+
+      if (_clientId != null) {
+        if (dec case {
+          'resource_access': final Map<String, dynamic> resourceAccess,
+        }) {
+          if (resourceAccess[_clientId] case {'roles': final List rolesList}) {
+            roles.addAll(rolesList.map((v) => v.toString()));
+          }
+        }
+      }
+
       if (dec case {'realm_access': {'roles': final List rolesList}}) {
-        return rolesList.map((v) => v.toString()).toSet();
+        roles.addAll(rolesList.map((v) => v.toString()));
       }
     }
   } catch (_) {}
-  return null;
+  return roles;
 }
 
 class _AuthCredentials extends InheritedWidget {
