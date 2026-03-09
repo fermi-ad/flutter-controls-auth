@@ -25,13 +25,11 @@ typedef ScopeList = List<String>;
 class AuthInfo {
   final String realm;
   final String clientId;
-  final String clientSecret;
   final List<String> scopes;
 
   const AuthInfo({
     this.realm = "acnetconsole",
     this.clientId = "flutter-client",
-    this.clientSecret = "cJVgClqTqpRiw7xATJQ1eVVs2LHW0Ug1",
     this.scopes = const [],
   });
 }
@@ -50,11 +48,7 @@ Future<void> initAuth(AuthInfo ai) async {
   _authRequired = true;
 
   final issuer = await Issuer.discover(uri).timeout(tmo);
-  final Client client = Client(
-    issuer,
-    ai.clientId,
-    clientSecret: ai.clientSecret,
-  );
+  final Client client = Client(issuer, ai.clientId);
 
   _authenticate = () async {
     if (_credentials == null) {
