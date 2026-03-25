@@ -6,6 +6,7 @@ library;
 
 import 'dart:convert';
 import 'dart:async';
+import 'dart:developer' as dev;
 
 import 'package:flutter/material.dart';
 import 'package:openid_client/openid_client.dart';
@@ -13,12 +14,7 @@ import 'src/openid_browser.dart'
     if (dart.library.io) 'src/openid_io.dart'
     as oid;
 
-import 'dart:developer' as dev;
-
 export 'package:openid_client/openid_client.dart' show Credential, UserInfo;
-
-/// Defines a set of of scopes (or "roles").
-typedef ScopeList = List<String>;
 
 /// Defines the authorization information required by the application. This
 /// is the one structure that applications will use.
