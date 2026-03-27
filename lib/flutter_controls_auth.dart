@@ -98,8 +98,6 @@ Set<String> _extractRolesFromJwt(String? jwt, String? clientId) {
 
       final dec = jsonDecode(_base64UrlDecode(payloadBase64Url));
 
-      dev.log("decoded JWT: $dec", name: "auth");
-
       // If the client ID isn't defined, there are no client-specific roles to
       // extract.
 
@@ -131,10 +129,7 @@ class _AuthCredentials extends InheritedWidget {
       _roles = _extractRolesFromJwt(
         _credentials.value?.response?['access_token'] as String?,
         _clientId,
-      ) {
-    dev.log("credentials: ${_credentials.value?.response}", name: "auth");
-    dev.log("roles: ${_roles.join(', ')}", name: "auth");
-  }
+      );
 
   @override
   bool updateShouldNotify(covariant _AuthCredentials oldWidget) =>
@@ -164,17 +159,12 @@ class AuthService extends StatefulWidget {
       ?.credentials;
 
   /// Returns the Access Token (JWT) containing authorization roles and claims.
-  static String? getJwt(BuildContext context) {
-    final jwt =
-        context
-                .dependOnInheritedWidgetOfExactType<_AuthCredentials>()
-                ?.credentials
-                ?.response?['access_token']
-            as String?;
-
-    dev.log("getJwt: $jwt", name: "auth");
-    return jwt;
-  }
+  static String? getJwt(BuildContext context) =>
+      context
+              .dependOnInheritedWidgetOfExactType<_AuthCredentials>()
+              ?.credentials
+              ?.response?['access_token']
+          as String?;
 
   static bool inRole(BuildContext context, String name) =>
       context
