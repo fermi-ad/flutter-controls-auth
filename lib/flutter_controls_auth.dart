@@ -6,6 +6,7 @@ library;
 
 import 'dart:convert';
 import 'dart:async';
+import 'dart:developer' as dev;
 
 import 'package:flutter/material.dart';
 import 'package:openid_client/openid_client.dart';
@@ -13,31 +14,24 @@ import 'src/openid_browser.dart'
     if (dart.library.io) 'src/openid_io.dart'
     as oid;
 
-import 'dart:developer' as dev;
-
 export 'package:openid_client/openid_client.dart' show Credential, UserInfo;
-
-/// Defines a set of of scopes (or "roles").
-typedef ScopeList = List<String>;
 
 /// Defines the authorization information required by the application. This
 /// is the one structure that applications will use.
 class AuthInfo {
   final String realm;
   final String clientId;
-  final List<String> scopes;
 
   const AuthInfo({
     this.realm = "acnetconsole",
     this.clientId = "flutter-client",
-    this.scopes = const [],
   });
 }
 
 // These are global resources for the module. Applications cannot have more
 // than one set of credentials.
 
-Credential? _credentials;
+final ValueNotifier<Credential?> _credentials = ValueNotifier(null);
 Future<Credential?> Function() _authenticate = () async => null;
 bool _authRequired = false;
 String? _clientId;
@@ -45,6 +39,7 @@ String? _clientId;
 Future<void> initAuth(AuthInfo ai) async {
   final uri = Uri.parse('https://ad-auth.fnal.gov/realms/${ai.realm}/');
   const Duration tmo = Duration(seconds: 2);
+  const List<String> scopes = ["openid", "profile", "roles"];
 
   _authRequired = true;
   _clientId = ai.clientId;
@@ -53,18 +48,19 @@ Future<void> initAuth(AuthInfo ai) async {
   final Client client = Client(issuer, ai.clientId);
 
   _authenticate = () async {
-    if (_credentials == null) {
+    if (_credentials.value == null) {
       try {
-        return oid.authenticate(client, scopes: ai.scopes).timeout(tmo);
+        return await oid.authenticate(client, scopes: scopes).timeout(tmo);
       } on TimeoutException {
         dev.log('timeout communicating with KeyCloak', name: "auth");
         return null;
       }
+    } else {
+      return _credentials.value;
     }
-    return _credentials;
   };
 
-  _credentials = await oid.getRedirectResult(client, scopes: ai.scopes);
+  _credentials.value = await oid.getRedirectResult(client, scopes: scopes);
 }
 
 String _base64UrlDecode(String base64Url) {
@@ -87,7 +83,7 @@ String _base64UrlDecode(String base64Url) {
 // function pulls the roles defined for the entire realm and for the current
 // application.
 
-Set<String> extractRolesFromJwt(String? jwt) {
+Set<String> _extractRolesFromJwt(String? jwt, String? clientId) {
   // Initialize the set of roles.
 
   final Set<String> roles = {};
@@ -105,11 +101,11 @@ Set<String> extractRolesFromJwt(String? jwt) {
       // If the client ID isn't defined, there are no client-specific roles to
       // extract.
 
-      if (_clientId != null) {
+      if (clientId != null) {
         if (dec case {
           'resource_access': final Map<String, dynamic> resourceAccess,
         }) {
-          if (resourceAccess[_clientId] case {'roles': final List rolesList}) {
+          if (resourceAccess[clientId] case {'roles': final List rolesList}) {
             roles.addAll(rolesList.map((v) => v.toString()));
           }
         }
@@ -129,9 +125,10 @@ class _AuthCredentials extends InheritedWidget {
   final Set<String> _roles;
 
   _AuthCredentials({this.userInfo, required super.child})
-    : credentials = _credentials,
-      _roles = extractRolesFromJwt(
-        _credentials?.idToken.toCompactSerialization(),
+    : credentials = _credentials.value,
+      _roles = _extractRolesFromJwt(
+        _credentials.value?.response?['access_token'] as String?,
+        _clientId,
       );
 
   @override
@@ -161,11 +158,13 @@ class AuthService extends StatefulWidget {
       .dependOnInheritedWidgetOfExactType<_AuthCredentials>()
       ?.credentials;
 
-  static String? getJwt(BuildContext context) => context
-      .dependOnInheritedWidgetOfExactType<_AuthCredentials>()
-      ?.credentials
-      ?.idToken
-      .toCompactSerialization();
+  /// Returns the Access Token (JWT) containing authorization roles and claims.
+  static String? getJwt(BuildContext context) =>
+      context
+              .dependOnInheritedWidgetOfExactType<_AuthCredentials>()
+              ?.credentials
+              ?.response?['access_token']
+          as String?;
 
   static bool inRole(BuildContext context, String name) =>
       context
@@ -187,12 +186,12 @@ class AuthService extends StatefulWidget {
 class _AuthState extends State<AuthService> {
   UserInfo? userInfo;
 
-  bool get authenticated => _credentials != null;
+  bool get authenticated => _credentials.value != null;
 
   // Set-up a background process to retrieve the user's information.
 
   Future<void> getUserInfo() async {
-    _credentials
+    _credentials.value
         ?.getUserInfo()
         .then((value) => setState(() => userInfo = value))
         .catchError((err) => dev.log("userInfo returned $err"));
@@ -208,6 +207,27 @@ class _AuthState extends State<AuthService> {
     if (authenticated) {
       Future<void>.microtask(getUserInfo);
     }
+
+    // Listen for changes to global credentials (e.g. from initAuth or other calls)
+    _credentials.addListener(_handleCredsChanged);
+  }
+
+  @override
+  void dispose() {
+    _credentials.removeListener(_handleCredsChanged);
+    super.dispose();
+  }
+
+  void _handleCredsChanged() {
+    if (mounted) {
+      if (authenticated && userInfo == null) {
+        getUserInfo();
+      } else if (!authenticated) {
+        setState(() => userInfo = null);
+      } else {
+        setState(() {});
+      }
+    }
   }
 
   Future<void> requestLogin() async {
@@ -220,10 +240,8 @@ class _AuthState extends State<AuthService> {
       if (creds != null) {
         final user = await creds.getUserInfo();
 
-        setState(() {
-          _credentials = creds;
-          userInfo = user;
-        });
+        userInfo = user;
+        _credentials.value = creds;
       }
     }
   }
@@ -235,17 +253,15 @@ class _AuthState extends State<AuthService> {
 
   Future<void> requestLogout() async {
     if (authenticated) {
-      final Credential tmp = _credentials!;
+      final Credential tmp = _credentials.value!;
 
       Future<void>.microtask(
         () async => await tmp.revoke().onError(
           (error, trace) => dev.log("revoke error: $error"),
         ),
       );
-      setState(() {
-        _credentials = null;
-        userInfo = null;
-      });
+      userInfo = null;
+      _credentials.value = null;
     }
   }
 
