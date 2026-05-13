@@ -22,10 +22,7 @@ class AuthInfo {
   final String realm;
   final String clientId;
 
-  const AuthInfo({
-    this.realm = "acnetconsole",
-    this.clientId = "flutter-client",
-  });
+  const AuthInfo({this.realm = "acnetconsole", required this.clientId});
 }
 
 // These are global resources for the module. Applications cannot have more
