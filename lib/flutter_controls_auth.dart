@@ -36,7 +36,7 @@ String? _clientId;
 Future<void> initAuth(AuthInfo ai) async {
   final uri = Uri.parse('https://ad-auth.fnal.gov/realms/${ai.realm}/');
   const Duration tmo = Duration(seconds: 2);
-  const List<String> scopes = ["openid", "profile", "roles"];
+  const List<String> scopes = ["roles"];
 
   _authRequired = true;
   _clientId = ai.clientId;
