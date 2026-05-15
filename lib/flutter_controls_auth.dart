@@ -47,9 +47,13 @@ Future<void> initAuth(AuthInfo ai) async {
   _authenticate = () async {
     if (_credentials.value == null) {
       try {
-        return await oid.authenticate(client, scopes: scopes).timeout(tmo);
-      } on TimeoutException {
-        dev.log('timeout communicating with KeyCloak', name: "auth");
+        // No timeout here: on mobile/desktop the user must interact with an
+        // external browser, which can take an arbitrary amount of time. On the
+        // web platform authenticate() triggers a page redirect and the returned
+        // future never completes, so a timeout would be meaningless there too.
+        return await oid.authenticate(client, scopes: scopes);
+      } catch (e) {
+        dev.log('authentication failed: $e', name: "auth");
         return null;
       }
     } else {

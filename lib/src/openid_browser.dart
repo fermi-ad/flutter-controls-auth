@@ -1,27 +1,14 @@
 import 'dart:async';
 import 'dart:js_interop';
-import 'dart:math';
 
 import 'package:openid_client/openid_client.dart';
 import 'package:web/web.dart' hide Credential, Client;
 
+import 'openid_common.dart';
+
 const _stateKey = 'openid_client:state';
 const _codeVerifierKey = 'openid_client:code_verifier';
 const _redirectUriKey = 'openid_client:redirect_uri';
-
-/// Generates a cryptographically random string suitable for use as a PKCE
-/// code verifier (RFC 7636 §4.1). Uses [Random.secure] and the unreserved
-/// character set [A-Z / a-z / 0-9 / "-" / "." / "_" / "~"].
-String _generateCodeVerifier([int length = 128]) {
-  const charset =
-      'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
-  final rng = Random.secure();
-
-  return List.generate(
-    length,
-    (_) => charset[rng.nextInt(charset.length)],
-  ).join();
-}
 
 /// Computes a clean redirect URI from the current browser location by stripping
 /// the fragment and any query parameters (which may include leftover auth
@@ -29,11 +16,6 @@ String _generateCodeVerifier([int length = 128]) {
 Uri _baseRedirectUri() => Uri.parse(
   window.location.href,
 ).removeFragment().replace(queryParameters: <String, String>{});
-
-/// Merges the caller's scopes with the OpenID Connect scopes required to
-/// receive an ID token containing user-info claims.
-List<String> _mergeScopes(List<String> scopes) =>
-    {...scopes, 'openid', 'profile', 'email'}.toList();
 
 Future<Credential> authenticate(
   Client client, {
@@ -47,11 +29,11 @@ Future<Credential> authenticate(
   // NOTE: The KeyCloak client must have the app's origin listed in its
   // "Web Origins" setting so the browser can POST to the token endpoint.
 
-  final codeVerifier = _generateCodeVerifier();
+  final codeVerifier = generateCodeVerifier();
   final redirectUri = _baseRedirectUri();
   final flow = Flow.authorizationCodeWithPKCE(
     client,
-    scopes: _mergeScopes(scopes),
+    scopes: mergeScopes(scopes),
     codeVerifier: codeVerifier,
   )..redirectUri = redirectUri;
 
@@ -106,7 +88,7 @@ Future<Credential?> getRedirectResult(
 
   final flow = Flow.authorizationCodeWithPKCE(
     client,
-    scopes: _mergeScopes(scopes),
+    scopes: mergeScopes(scopes),
     state: savedState,
     codeVerifier: savedVerifier,
   )..redirectUri = Uri.parse(savedRedirectUri);
