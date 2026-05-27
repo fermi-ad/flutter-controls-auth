@@ -22,10 +22,7 @@ class AuthInfo {
   final String realm;
   final String clientId;
 
-  const AuthInfo({
-    this.realm = "acnetconsole",
-    this.clientId = "flutter-client",
-  });
+  const AuthInfo({this.realm = "acnetconsole", required this.clientId});
 }
 
 // These are global resources for the module. Applications cannot have more
@@ -39,7 +36,7 @@ String? _clientId;
 Future<void> initAuth(AuthInfo ai) async {
   final uri = Uri.parse('https://ad-auth.fnal.gov/realms/${ai.realm}/');
   const Duration tmo = Duration(seconds: 2);
-  const List<String> scopes = ["openid", "profile", "roles"];
+  const List<String> scopes = ["roles"];
 
   _authRequired = true;
   _clientId = ai.clientId;
@@ -188,13 +185,19 @@ class _AuthState extends State<AuthService> {
 
   bool get authenticated => _credentials.value != null;
 
-  // Set-up a background process to retrieve the user's information.
+  // Extract user information from the ID token claims (which implement
+  // UserInfo). This avoids a cross-origin GET to the /userinfo endpoint,
+  // eliminating a CORS dependency on the authorization server.
 
-  Future<void> getUserInfo() async {
-    _credentials.value
-        ?.getUserInfo()
-        .then((value) => setState(() => userInfo = value))
-        .catchError((err) => dev.log("userInfo returned $err"));
+  void getUserInfo() {
+    final creds = _credentials.value;
+    if (creds == null) return;
+
+    try {
+      setState(() => userInfo = creds.idToken.claims);
+    } catch (err) {
+      dev.log("extracting userInfo from ID token failed: $err");
+    }
   }
 
   @override
@@ -238,9 +241,7 @@ class _AuthState extends State<AuthService> {
       // information.
 
       if (creds != null) {
-        final user = await creds.getUserInfo();
-
-        userInfo = user;
+        userInfo = creds.idToken.claims;
         _credentials.value = creds;
       }
     }
