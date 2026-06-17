@@ -22,7 +22,17 @@ class AuthInfo {
   final String realm;
   final String clientId;
 
-  const AuthInfo({this.realm = "acnetconsole", required this.clientId});
+  /// The OAuth 2.0 audience (resource server) this app targets. When `null`
+  /// (the default) only realm-wide roles are available in the token. Set this
+  /// to a Keycloak client ID to receive that client's roles in
+  /// `resource_access`.
+  final String? audience;
+
+  const AuthInfo({
+    this.realm = "acnetconsole",
+    required this.clientId,
+    this.audience,
+  });
 }
 
 // These are global resources for the module. Applications cannot have more
@@ -32,6 +42,8 @@ final ValueNotifier<Credential?> _credentials = ValueNotifier(null);
 Future<Credential?> Function() _authenticate = () async => null;
 bool _authRequired = false;
 String? _clientId;
+String? _audience;
+List<String> _scopes = const [];
 
 Future<void> initAuth(AuthInfo ai) async {
   final uri = Uri.parse('https://ad-auth.fnal.gov/realms/${ai.realm}/');
@@ -40,9 +52,14 @@ Future<void> initAuth(AuthInfo ai) async {
 
   _authRequired = true;
   _clientId = ai.clientId;
+  _audience = ai.audience;
+  _scopes = scopes;
 
   final issuer = await Issuer.discover(uri).timeout(tmo);
   final Client client = Client(issuer, ai.clientId);
+
+  // Always set up the authenticate closure first so requestLogin() works
+  // regardless of whether a cached credential is found below.
 
   _authenticate = () async {
     if (_credentials.value == null) {
@@ -61,7 +78,31 @@ Future<void> initAuth(AuthInfo ai) async {
     }
   };
 
-  _credentials.value = await oid.getRedirectResult(client, scopes: scopes);
+  // On the web platform, check the localStorage cache before triggering a
+  // full login flow. A cached, non-expired token for this audience + scope
+  // set means the user already authenticated in another app on the same
+  // origin — no redirect needed.
+
+  final cached = oid.loadCredential(
+    client,
+    audience: ai.audience,
+    scopes: scopes,
+  );
+
+  if (cached != null) {
+    _credentials.value = cached;
+    return;
+  }
+
+  // Check whether this page load is the post-login redirect carrying an
+  // authorization code. If so, exchange it for tokens and persist them.
+
+  final redirectCred = await oid.getRedirectResult(client, scopes: scopes);
+
+  if (redirectCred != null) {
+    oid.saveCredential(redirectCred, audience: ai.audience, scopes: scopes);
+    _credentials.value = redirectCred;
+  }
 }
 
 String _base64UrlDecode(String base64Url) {
@@ -246,10 +287,11 @@ class _AuthState extends State<AuthService> {
     if (!authenticated) {
       final creds = await _authenticate();
 
-      // If we successfully get credentials, try to get the user's
-      // information.
+      // If we successfully get credentials, persist them in the cache and
+      // extract user info.
 
       if (creds != null) {
+        oid.saveCredential(creds, audience: _audience, scopes: _scopes);
         userInfo = creds.idToken.claims;
         _credentials.value = creds;
       }
@@ -258,12 +300,16 @@ class _AuthState extends State<AuthService> {
 
   /// Requests the app's credentials be revoked.
   ///
-  /// This method will clear out the local credentials and request the server
-  /// invalid the authentication token.
+  /// This method will clear out the local credentials, remove the cached
+  /// token from localStorage, and request the server invalidate the token.
 
   Future<void> requestLogout() async {
     if (authenticated) {
       final Credential tmp = _credentials.value!;
+
+      // Remove the cached credential so other apps on the same origin also
+      // see the user as logged out on their next cache check.
+      oid.clearCredential(audience: _audience, scopes: _scopes);
 
       Future<void>.microtask(
         () async => await tmp.revoke().onError(

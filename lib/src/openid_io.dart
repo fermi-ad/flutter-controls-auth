@@ -168,3 +168,21 @@ Future<Credential?> getRedirectResult(
   Client client, {
   List<String> scopes = const [],
 }) async => null;
+
+/// No-op on non-web platforms — there is no shared local storage between
+/// native apps, so credential caching is not supported here.
+void saveCredential(
+  Credential credential, {
+  String? audience,
+  List<String> scopes = const [],
+}) {}
+
+/// Always returns `null` on non-web platforms.
+Credential? loadCredential(
+  Client client, {
+  String? audience,
+  List<String> scopes = const [],
+}) => null;
+
+/// No-op on non-web platforms.
+void clearCredential({String? audience, List<String> scopes = const []}) {}
