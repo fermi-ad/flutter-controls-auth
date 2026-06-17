@@ -208,11 +208,16 @@ class _AuthState extends State<AuthService> {
   void initState() {
     super.initState();
 
-    // If the credentials aren't `null`, then we can retrieve the user
-    // information. Start a background task to access the user info.
+    // If credentials are already present, extract user info synchronously.
+    // Since the JWT contains the user info, there's no async work needed, and
+    // doing this directly in initState avoids a spurious setState/rebuild cycle.
 
     if (authenticated) {
-      Future<void>.microtask(getUserInfo);
+      try {
+        userInfo = _credentials.value!.idToken.claims;
+      } catch (err) {
+        dev.log("extracting userInfo from ID token failed: $err");
+      }
     }
 
     // Listen for changes to global credentials (e.g. from initAuth or other calls)
