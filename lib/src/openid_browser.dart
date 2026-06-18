@@ -1,26 +1,99 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:js_interop';
-import 'dart:math';
 
 import 'package:openid_client/openid_client.dart';
 import 'package:web/web.dart' hide Credential, Client;
+
+import 'openid_common.dart';
 
 const _stateKey = 'openid_client:state';
 const _codeVerifierKey = 'openid_client:code_verifier';
 const _redirectUriKey = 'openid_client:redirect_uri';
 
-/// Generates a cryptographically random string suitable for use as a PKCE
-/// code verifier (RFC 7636 §4.1). Uses [Random.secure] and the unreserved
-/// character set [A-Z / a-z / 0-9 / "-" / "." / "_" / "~"].
-String _generateCodeVerifier([int length = 128]) {
-  const charset =
-      'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
-  final rng = Random.secure();
+/// Builds the `localStorage` key used to cache a credential. The key is
+/// namespaced under `controls:credential` and qualified by [audience] (empty
+/// string when `null`) and the sorted, space-joined [scopes] so that tokens
+/// for different resource servers or scope sets are stored independently.
+String _credentialKey(String? audience, List<String> scopes) {
+  final sortedScopes = ([...scopes]..sort()).join(' ');
 
-  return List.generate(
-    length,
-    (_) => charset[rng.nextInt(charset.length)],
-  ).join();
+  return 'controls:credential:${audience ?? ''}:$sortedScopes';
+}
+
+/// Persists [credential] in `localStorage` under a key derived from
+/// [audience] and [scopes]. The raw token-response map is JSON-encoded so
+/// that it survives page reloads and is readable by any app on the same
+/// origin.
+void saveCredential(
+  Credential credential, {
+  String? audience,
+  List<String> scopes = const [],
+}) {
+  final response = credential.response;
+
+  if (response == null) return;
+
+  final key = _credentialKey(audience, scopes);
+
+  window.localStorage.setItem(key, jsonEncode(response));
+}
+
+/// Loads a previously cached [Credential] from `localStorage` for the given
+/// [audience] and [scopes]. Returns `null` when no entry exists, the stored
+/// JSON is malformed, or the access token has already expired.
+///
+/// Expiry is checked against the `expires_at` field (Unix seconds) written
+/// by [saveCredential]. A 30-second clock-skew buffer is applied so that a
+/// token that is about to expire is treated as expired and will be refreshed
+/// before it is actually invalid.
+Credential? loadCredential(
+  Client client, {
+  String? audience,
+  List<String> scopes = const [],
+}) {
+  final key = _credentialKey(audience, scopes);
+  final raw = window.localStorage.getItem(key);
+
+  if (raw == null) return null;
+
+  try {
+    final Map<String, dynamic> response = (jsonDecode(raw) as Map)
+        .cast<String, dynamic>();
+
+    // Reject tokens that have already expired (with a 30-second buffer).
+    final expiresAt = response['expires_at'];
+
+    if (expiresAt is num) {
+      final expiry = DateTime.fromMillisecondsSinceEpoch(
+        (expiresAt * 1000).toInt(),
+      );
+
+      if (DateTime.now().isAfter(
+        expiry.subtract(const Duration(seconds: 30)),
+      )) {
+        window.localStorage.removeItem(key);
+        return null;
+      }
+    }
+
+    return client.createCredential(
+      accessToken: response['access_token'] as String? ?? '',
+      idToken: response['id_token'] as String?,
+      refreshToken: response['refresh_token'] as String?,
+      tokenType: response['token_type'] as String? ?? 'Bearer',
+    );
+  } catch (_) {
+    // Corrupt entry — remove it so the next call triggers a fresh login.
+    window.localStorage.removeItem(key);
+    return null;
+  }
+}
+
+/// Removes the cached credential for [audience] + [scopes] from
+/// `localStorage`, e.g. on logout.
+void clearCredential({String? audience, List<String> scopes = const []}) {
+  window.localStorage.removeItem(_credentialKey(audience, scopes));
 }
 
 /// Computes a clean redirect URI from the current browser location by stripping
@@ -29,11 +102,6 @@ String _generateCodeVerifier([int length = 128]) {
 Uri _baseRedirectUri() => Uri.parse(
   window.location.href,
 ).removeFragment().replace(queryParameters: <String, String>{});
-
-/// Merges the caller's scopes with the OpenID Connect scopes required to
-/// receive an ID token containing user-info claims.
-List<String> _mergeScopes(List<String> scopes) =>
-    {...scopes, 'openid', 'profile', 'email'}.toList();
 
 Future<Credential> authenticate(
   Client client, {
@@ -47,11 +115,11 @@ Future<Credential> authenticate(
   // NOTE: The KeyCloak client must have the app's origin listed in its
   // "Web Origins" setting so the browser can POST to the token endpoint.
 
-  final codeVerifier = _generateCodeVerifier();
+  final codeVerifier = generateCodeVerifier();
   final redirectUri = _baseRedirectUri();
   final flow = Flow.authorizationCodeWithPKCE(
     client,
-    scopes: _mergeScopes(scopes),
+    scopes: mergeScopes(scopes),
     codeVerifier: codeVerifier,
   )..redirectUri = redirectUri;
 
@@ -106,7 +174,7 @@ Future<Credential?> getRedirectResult(
 
   final flow = Flow.authorizationCodeWithPKCE(
     client,
-    scopes: _mergeScopes(scopes),
+    scopes: mergeScopes(scopes),
     state: savedState,
     codeVerifier: savedVerifier,
   )..redirectUri = Uri.parse(savedRedirectUri);
