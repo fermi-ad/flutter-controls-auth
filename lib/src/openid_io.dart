@@ -114,7 +114,10 @@ Future<Map<String, String>> _waitForCallback(
   String state,
 ) async {
   await for (final request in server) {
-    // Only process GET requests to the root path.
+    // Only process GET requests to the root path. The authorization server
+    // will always deliver the callback to GET /. Checking for the root path is
+    // simply matching what was registered — any other path is definitionally
+    // not the OAuth callback.
 
     if (request.method != 'GET' || request.uri.path != '/') {
       request.response
