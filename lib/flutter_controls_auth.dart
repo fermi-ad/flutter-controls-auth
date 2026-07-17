@@ -10,6 +10,7 @@ import 'dart:developer' as dev;
 
 import 'package:flutter/material.dart';
 import 'package:openid_client/openid_client.dart';
+import 'package:toastification/toastification.dart';
 import 'src/openid_browser.dart'
     if (dart.library.io) 'src/openid_io.dart'
     as oid;
@@ -322,6 +323,38 @@ class _AuthState extends State<AuthService> {
   }
 
   @override
-  Widget build(BuildContext context) =>
-      _AuthCredentials(userInfo: userInfo, child: widget.child);
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+
+    if (userInfo != null) {
+      Future.microtask(() {
+        if (context.mounted) {
+          return toastification.show(
+            context: context,
+            type: .info,
+            style: .minimal,
+            title: Text(
+              "Notice",
+              style: theme.textTheme.titleMedium?.copyWith(color: Colors.black),
+            ),
+            description: Text(
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: Colors.black,
+                fontWeight: .bold,
+              ),
+              'You are logged in as ${userInfo!.name ?? "UNKNOWN"}.',
+            ),
+            alignment: .topRight,
+            autoCloseDuration: Duration(seconds: 4),
+            showProgressBar: false,
+            closeButton: const ToastCloseButton(showType: .always),
+            closeOnClick: true,
+            dragToClose: true,
+          );
+        }
+      });
+    }
+
+    return _AuthCredentials(userInfo: userInfo, child: widget.child);
+  }
 }
