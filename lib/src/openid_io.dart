@@ -150,6 +150,25 @@ Future<Map<String, String>> _waitForCallback(
       continue;
     }
 
+    // Surface any error the authorization server returned before handing
+    // control back to the caller. OAuth 2.0 (RFC 6749 §4.1.2.1) delivers
+    // errors as ?error=...&error_description=... query parameters.
+
+    final error = params['error'];
+
+    if (error != null) {
+      final description = params['error_description'] ?? 'no description';
+
+      request.response
+        ..statusCode = HttpStatus.badRequest
+        ..write('Authorization error: $error');
+      await request.response.close();
+
+      throw Exception(
+        'Authorization server returned error: $error ($description)',
+      );
+    }
+
     // Respond with a user-friendly page and return the parameters.
 
     request.response

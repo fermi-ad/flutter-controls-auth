@@ -47,6 +47,8 @@ String? _audience;
 List<String> _scopes = const [];
 
 Future<void> initAuth(AuthInfo ai) async {
+  assert(!_authRequired, 'initAuth() must only be called once.');
+
   final uri = Uri.parse('https://ad-auth.fnal.gov/realms/${ai.realm}/');
   const Duration tmo = Duration(seconds: 2);
   const List<String> scopes = ["roles"];
