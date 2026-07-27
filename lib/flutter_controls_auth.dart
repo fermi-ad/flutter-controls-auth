@@ -10,12 +10,13 @@ import 'dart:developer' as dev;
 
 import 'package:flutter/material.dart';
 import 'package:openid_client/openid_client.dart';
-import 'package:toastification/toastification.dart';
 import 'src/openid_browser.dart'
     if (dart.library.io) 'src/openid_io.dart'
     as oid;
+import 'src/message_boxes.dart' show errorBox, infoBox;
 
 export 'package:openid_client/openid_client.dart' show Credential, UserInfo;
+export 'src/message_boxes.dart' show errorBox, infoBox, warningBox;
 
 /// Defines the authorization information required by the application. This
 /// is the one structure that applications will use.
