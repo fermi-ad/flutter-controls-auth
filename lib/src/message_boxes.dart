@@ -5,8 +5,6 @@ library;
 import 'package:flutter/material.dart';
 import 'package:toastification/toastification.dart';
 
-const _defaultDuration = Duration(seconds: 4);
-
 void _showBox(
   BuildContext context,
   ToastificationType type,
@@ -33,7 +31,7 @@ void _showBox(
         color: theme.colorScheme.onInverseSurface,
       ),
     ),
-    autoCloseDuration: duration ?? _defaultDuration,
+    autoCloseDuration: duration,
   );
 }
 
@@ -42,8 +40,7 @@ void _showBox(
 /// - [context] is the [BuildContext] used to display the notification.
 /// - [title] is the bold heading of the notification.
 /// - [content] is the descriptive body text of the notification.
-/// - [duration] controls how long the notification is visible. Defaults to
-///   4 seconds if not provided.
+/// - [duration] controls how long the notification is visible.
 void errorBox(
   BuildContext context,
   String title,
@@ -56,8 +53,7 @@ void errorBox(
 /// - [context] is the [BuildContext] used to display the notification.
 /// - [title] is the bold heading of the notification.
 /// - [content] is the descriptive body text of the notification.
-/// - [duration] controls how long the notification is visible. Defaults to
-///   4 seconds if not provided.
+/// - [duration] controls how long the notification is visible.
 void warningBox(
   BuildContext context,
   String title,
@@ -70,8 +66,7 @@ void warningBox(
 /// - [context] is the [BuildContext] used to display the notification.
 /// - [title] is the bold heading of the notification.
 /// - [content] is the descriptive body text of the notification.
-/// - [duration] controls how long the notification is visible. Defaults to
-///   4 seconds if not provided.
+/// - [duration] controls how long the notification is visible.
 void infoBox(
   BuildContext context,
   String title,
