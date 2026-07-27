@@ -140,6 +140,12 @@ Future<Credential> authenticate(
   return Completer<Credential>().future;
 }
 
+/// Returns `true` when the current page URL contains an OAuth authorization
+/// code — i.e. this page load is the post-login redirect from Keycloak.
+/// This check is pure URL inspection; it makes no network calls.
+bool hasRedirectCode() =>
+    Uri.parse(window.location.href).queryParameters.containsKey('code');
+
 Future<Credential?> getRedirectResult(
   Client client, {
   List<String> scopes = const [],

@@ -5,7 +5,6 @@
 library;
 
 import 'dart:convert';
-import 'dart:async';
 import 'dart:developer' as dev;
 
 import 'package:flutter/material.dart';
@@ -114,10 +113,11 @@ class _AuthCredentials extends InheritedWidget {
 /// [ToastificationWrapper] if you use toastification). Pass your [AuthInfo]
 /// directly — there is no separate `initAuth()` call required.
 ///
-/// The widget renders immediately. While the OpenID discovery request is in
-/// flight it shows [loadingWidget] (defaults to a centered
-/// [CircularProgressIndicator]). If discovery fails it shows [errorBuilder],
-/// which receives the error and a retry callback.
+/// The widget renders immediately with no network calls. Keycloak is only
+/// contacted when the user explicitly calls [requestLogin], or on web when
+/// the page load is the post-login redirect carrying an authorization code.
+/// If Keycloak is unreachable, an [errorBox] toast is shown at that point;
+/// the app continues to function for unprivileged use.
 ///
 /// Example:
 /// ```dart
@@ -130,22 +130,7 @@ class AuthService extends StatefulWidget {
   final AuthInfo authInfo;
   final Widget child;
 
-  /// Shown while the OpenID Connect discovery document is being fetched.
-  /// Defaults to a centered [CircularProgressIndicator].
-  final Widget? loadingWidget;
-
-  /// Called when discovery fails (e.g. Keycloak is unreachable). Receives the
-  /// error and a [retry] callback. Defaults to a simple error card with a
-  /// Retry button.
-  final Widget Function(Object error, VoidCallback retry)? errorBuilder;
-
-  const AuthService({
-    required this.authInfo,
-    required this.child,
-    this.loadingWidget,
-    this.errorBuilder,
-    super.key,
-  });
+  const AuthService({required this.authInfo, required this.child, super.key});
 
   @override
   State<AuthService> createState() => _AuthState();
@@ -179,18 +164,12 @@ class AuthService extends StatefulWidget {
       await context.findAncestorStateOfType<_AuthState>()?.requestLogout();
 }
 
-// Tracks whether the OpenID discovery + client setup has completed.
-enum _InitStatus { loading, ready, error }
-
 class _AuthState extends State<AuthService> {
   // ---------------------------------------------------------------------------
-  // Instance state — replaces the old module-level globals
+  // Instance state
   // ---------------------------------------------------------------------------
 
   static const List<String> _scopes = ['roles'];
-
-  _InitStatus _initStatus = _InitStatus.loading;
-  Object? _initError;
 
   Credential? _credential;
   UserInfo? _userInfo;
@@ -199,7 +178,8 @@ class _AuthState extends State<AuthService> {
   // build() call.
   Set<String> _roles = const {};
 
-  // Set once discovery succeeds; used by requestLogin / requestLogout.
+  // Lazily set on first successful Issuer.discover(); reused for all
+  // subsequent login attempts.
   Client? _client;
 
   AuthInfo get _info => widget.authInfo;
@@ -216,67 +196,88 @@ class _AuthState extends State<AuthService> {
     _initialize();
   }
 
+  // Runs at startup with zero network calls unless a redirect code is present.
   Future<void> _initialize() async {
-    final ai = _info;
-    final uri = Uri.parse('https://ad-auth.fnal.gov/realms/${ai.realm}/');
-    const tmo = Duration(seconds: 2);
+    // On web: if this page load is the post-login redirect (URL contains
+    // ?code=...), we must exchange the code immediately — it expires quickly.
+    // In every other case we skip discovery entirely and let the app render.
+    if (!oid.hasRedirectCode()) {
+      // No redirect code. Check localStorage for a cached token (no network).
+      // We need a Client to reconstruct the Credential object, but we can
+      // build a stub issuer from the well-known URL without fetching it —
+      // loadCredential only needs the client to call client.createCredential(),
+      // which is a pure local operation. However, the openid_client library
+      // requires a real Issuer, so we must discover lazily here only if cached.
+      //
+      // Simpler: just skip the cache check at startup and let the user log in
+      // normally. The cache is an optimisation for web SSO; on native there is
+      // no cache at all. If the user has a cached token the login flow will
+      // find it via loadCredential() inside _ensureClient().
+      return;
+    }
+
+    // Redirect code present — must discover and exchange now.
+    final client = await _ensureClient();
+    if (client == null || !mounted) return;
 
     try {
-      final issuer = await Issuer.discover(uri).timeout(tmo);
-      final client = Client(issuer, ai.clientId);
-
-      // Check the localStorage cache before triggering a full login flow.
-      final cached = oid.loadCredential(
-        client,
-        audience: ai.audience,
-        scopes: _scopes,
-      );
-
-      if (cached != null) {
-        if (!mounted) return;
-        setState(() {
-          _client = client;
-          _setCredential(cached);
-          _initStatus = _InitStatus.ready;
-        });
-        return;
-      }
-
-      // Check whether this page load is the post-login redirect carrying an
-      // authorization code. If so, exchange it for tokens and persist them.
       final redirectCred = await oid.getRedirectResult(client, scopes: _scopes);
-
       if (!mounted) return;
 
       if (redirectCred != null) {
         oid.saveCredential(
           redirectCred,
-          audience: ai.audience,
+          audience: _info.audience,
           scopes: _scopes,
         );
-        setState(() {
-          _client = client;
-          _setCredential(redirectCred);
-          _initStatus = _InitStatus.ready;
-        });
-      } else {
-        setState(() {
-          _client = client;
-          _initStatus = _InitStatus.ready;
-        });
+        setState(() => _setCredential(redirectCred));
       }
     } catch (e) {
-      dev.log('OpenID discovery failed: $e', name: 'auth');
-      if (!mounted) return;
-      setState(() {
-        _initError = e;
-        _initStatus = _InitStatus.error;
-      });
+      dev.log('redirect token exchange failed: $e', name: 'auth');
+      if (mounted) _showAuthError(e);
     }
   }
 
+  /// Ensures [_client] is set, performing [Issuer.discover()] if needed.
+  /// Returns the client on success, or `null` if discovery fails (in which
+  /// case an error toast has already been shown).
+  Future<Client?> _ensureClient() async {
+    if (_client != null) return _client;
+
+    final uri = Uri.parse('https://ad-auth.fnal.gov/realms/${_info.realm}/');
+    const tmo = Duration(seconds: 5);
+
+    try {
+      final issuer = await Issuer.discover(uri).timeout(tmo);
+      _client = Client(issuer, _info.clientId);
+      return _client;
+    } catch (e) {
+      dev.log('OpenID discovery failed: $e', name: 'auth');
+      if (mounted) _showAuthError(e);
+      return null;
+    }
+  }
+
+  void _showAuthError(Object e) {
+    // Schedule the toast after the current build frame completes.
+    // scheduleFrame() is required on desktop: Flutter won't render a new frame
+    // without user input when idle, so the postFrameCallback would never fire.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        errorBox(
+          context,
+          'Authentication Unavailable',
+          'Could not reach the authentication service. '
+              'Some features may be disabled.',
+          duration: const Duration(seconds: 8),
+        );
+      }
+    });
+    WidgetsBinding.instance.scheduleFrame();
+  }
+
   // Sets _credential, _userInfo, and _roles together so they're always in sync.
-  // Must be called inside setState().
+  // Must be called inside setState(). Shows the "logged in" toast once.
   void _setCredential(Credential cred) {
     _credential = cred;
     _userInfo = _tryExtractUserInfo(cred);
@@ -284,6 +285,20 @@ class _AuthState extends State<AuthService> {
       cred.response?['access_token'] as String?,
       _info.clientId,
     );
+
+    // Show the login toast after the frame that triggered this setState().
+    // scheduleFrame() is required on desktop: Flutter won't render a new frame
+    // without user input when idle, so the postFrameCallback would never fire.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _userInfo != null) {
+        infoBox(
+          context,
+          'Notice',
+          'You are logged in as ${_userInfo!.name ?? "UNKNOWN"}.',
+        );
+      }
+    });
+    WidgetsBinding.instance.scheduleFrame();
   }
 
   // Clears credential state together. Must be called inside setState().
@@ -307,10 +322,28 @@ class _AuthState extends State<AuthService> {
   // ---------------------------------------------------------------------------
 
   Future<void> requestLogin() async {
-    if (_authenticated || _client == null) return;
+    if (_authenticated) return;
+
+    final client = await _ensureClient();
+    if (client == null || !mounted) return;
+
+    // Check the localStorage cache before triggering a full login flow. A
+    // cached, non-expired token means the user already authenticated in another
+    // app on the same origin — no redirect needed.
+    final cached = oid.loadCredential(
+      client,
+      audience: _info.audience,
+      scopes: _scopes,
+    );
+
+    if (cached != null) {
+      if (!mounted) return;
+      setState(() => _setCredential(cached));
+      return;
+    }
 
     try {
-      final creds = await oid.authenticate(_client!, scopes: _scopes);
+      final creds = await oid.authenticate(client, scopes: _scopes);
       if (!mounted) return;
       oid.saveCredential(creds, audience: _info.audience, scopes: _scopes);
       setState(() => _setCredential(creds));
@@ -345,99 +378,10 @@ class _AuthState extends State<AuthService> {
   // ---------------------------------------------------------------------------
 
   @override
-  Widget build(BuildContext context) {
-    return switch (_initStatus) {
-      _InitStatus.loading => _buildLoading(context),
-      _InitStatus.error => _buildError(context),
-      _InitStatus.ready => _buildReady(context),
-    };
-  }
-
-  Widget _buildLoading(BuildContext context) =>
-      widget.loadingWidget ??
-      const Center(child: CircularProgressIndicator.adaptive());
-
-  void _retry() {
-    setState(() => _initStatus = _InitStatus.loading);
-    _initialize();
-  }
-
-  Widget _buildError(BuildContext context) {
-    if (widget.errorBuilder != null) {
-      return widget.errorBuilder!(_initError!, _retry);
-    }
-
-    return Center(
-      child: Card(
-        margin: const EdgeInsets.all(24),
-        child: Padding(
-          padding: const EdgeInsets.all(24),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.cloud_off, size: 48, color: Colors.red),
-              const SizedBox(height: 16),
-              Text(
-                'Authentication service unavailable',
-                style: Theme.of(context).textTheme.titleMedium,
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 8),
-              Text(
-                '$_initError',
-                style: Theme.of(context).textTheme.bodySmall,
-                textAlign: TextAlign.center,
-              ),
-              const SizedBox(height: 16),
-              FilledButton.icon(
-                onPressed: _retry,
-                icon: const Icon(Icons.refresh),
-                label: const Text('Retry'),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  Widget _buildReady(BuildContext context) {
-    final theme = Theme.of(context);
-
-    if (_userInfo != null) {
-      Future.microtask(() {
-        if (context.mounted) {
-          toastification.show(
-            context: context,
-            type: .info,
-            style: .minimal,
-            title: Text(
-              'Notice',
-              style: theme.textTheme.titleMedium?.copyWith(color: Colors.black),
-            ),
-            description: Text(
-              style: theme.textTheme.bodyMedium?.copyWith(
-                color: Colors.black,
-                fontWeight: .bold,
-              ),
-              'You are logged in as ${_userInfo!.name ?? "UNKNOWN"}.',
-            ),
-            alignment: .topRight,
-            autoCloseDuration: const Duration(seconds: 4),
-            showProgressBar: false,
-            closeButton: const ToastCloseButton(showType: .always),
-            closeOnClick: true,
-            dragToClose: true,
-          );
-        }
-      });
-    }
-
-    return _AuthCredentials(
-      credentials: _credential,
-      userInfo: _userInfo,
-      roles: _roles,
-      child: widget.child,
-    );
-  }
+  Widget build(BuildContext context) => _AuthCredentials(
+    credentials: _credential,
+    userInfo: _userInfo,
+    roles: _roles,
+    child: widget.child,
+  );
 }

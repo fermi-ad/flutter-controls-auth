@@ -184,6 +184,10 @@ Future<Map<String, String>> _waitForCallback(
   throw Exception('Authentication callback server closed unexpectedly');
 }
 
+/// Always returns `false` on non-web platforms — there is no browser URL to
+/// inspect for an OAuth redirect code.
+bool hasRedirectCode() => false;
+
 /// On non-web platforms there is no redirect-based result to recover; the
 /// loopback server handles the callback synchronously during [authenticate].
 Future<Credential?> getRedirectResult(
