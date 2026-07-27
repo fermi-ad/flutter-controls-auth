@@ -36,82 +36,8 @@ class AuthInfo {
   });
 }
 
-// These are global resources for the module. Applications cannot have more
-// than one set of credentials.
-
-final ValueNotifier<Credential?> _credentials = ValueNotifier(null);
-Future<Credential?> Function() _authenticate = () async => null;
-bool _authRequired = false;
-String? _clientId;
-String? _audience;
-List<String> _scopes = const [];
-
-Future<void> initAuth(AuthInfo ai) async {
-  assert(!_authRequired, 'initAuth() must only be called once.');
-
-  final uri = Uri.parse('https://ad-auth.fnal.gov/realms/${ai.realm}/');
-  const Duration tmo = Duration(seconds: 2);
-  const List<String> scopes = ["roles"];
-
-  _authRequired = true;
-  _clientId = ai.clientId;
-  _audience = ai.audience;
-  _scopes = scopes;
-
-  final issuer = await Issuer.discover(uri).timeout(tmo);
-  final Client client = Client(issuer, ai.clientId);
-
-  // Always set up the authenticate closure first so requestLogin() works
-  // regardless of whether a cached credential is found below.
-
-  _authenticate = () async {
-    if (_credentials.value == null) {
-      try {
-        // No timeout here: on mobile/desktop the user must interact with an
-        // external browser, which can take an arbitrary amount of time. On the
-        // web platform authenticate() triggers a page redirect and the returned
-        // future never completes, so a timeout would be meaningless there too.
-        return await oid.authenticate(client, scopes: scopes);
-      } catch (e) {
-        dev.log('authentication failed: $e', name: "auth");
-        return null;
-      }
-    } else {
-      return _credentials.value;
-    }
-  };
-
-  // On the web platform, check the localStorage cache before triggering a
-  // full login flow. A cached, non-expired token for this audience + scope
-  // set means the user already authenticated in another app on the same
-  // origin — no redirect needed.
-
-  final cached = oid.loadCredential(
-    client,
-    audience: ai.audience,
-    scopes: scopes,
-  );
-
-  if (cached != null) {
-    _credentials.value = cached;
-    return;
-  }
-
-  // Check whether this page load is the post-login redirect carrying an
-  // authorization code. If so, exchange it for tokens and persist them.
-
-  final redirectCred = await oid.getRedirectResult(client, scopes: scopes);
-
-  if (redirectCred != null) {
-    oid.saveCredential(redirectCred, audience: ai.audience, scopes: scopes);
-    _credentials.value = redirectCred;
-  }
-}
-
 String _base64UrlDecode(String base64Url) {
-  String normalized = base64Url
-      .replaceAll('-', '+') // Convert URL-safe characters back
-      .replaceAll('_', '/');
+  String normalized = base64Url.replaceAll('-', '+').replaceAll('_', '/');
 
   switch (normalized.length % 4) {
     case 2:
@@ -167,14 +93,14 @@ Set<String> _extractRolesFromJwt(String? jwt, String? clientId) {
 class _AuthCredentials extends InheritedWidget {
   final Credential? credentials;
   final UserInfo? userInfo;
-  final Set<String> _roles;
+  final Set<String> roles;
 
-  _AuthCredentials({this.userInfo, required super.child})
-    : credentials = _credentials.value,
-      _roles = _extractRolesFromJwt(
-        _credentials.value?.response?['access_token'] as String?,
-        _clientId,
-      );
+  const _AuthCredentials({
+    required this.credentials,
+    required this.userInfo,
+    required this.roles,
+    required super.child,
+  });
 
   @override
   bool updateShouldNotify(covariant _AuthCredentials oldWidget) =>
@@ -183,21 +109,45 @@ class _AuthCredentials extends InheritedWidget {
 
 /// Provides authentication services.
 ///
-/// This widget should be placed near the Scaffold of an application to minimize
-/// updates. Each update may trigger a new sign-on session. When this widget is
-/// created, the application isn't automatically authenticated. To initiate
-/// authentication, the [requestAuthentication] method should be called. This
-/// allows an application to run with limited features when not authenticated.
-
+/// Place this widget near the root of your application (inside
+/// [ToastificationWrapper] if you use toastification). Pass your [AuthInfo]
+/// directly — there is no separate `initAuth()` call required.
+///
+/// The widget renders immediately. While the OpenID discovery request is in
+/// flight it shows [loadingWidget] (defaults to a centered
+/// [CircularProgressIndicator]). If discovery fails it shows [errorBuilder],
+/// which receives the error and a retry callback.
+///
+/// Example:
+/// ```dart
+/// AuthService(
+///   authInfo: AuthInfo(clientId: 'my-app'),
+///   child: MyApp(),
+/// )
+/// ```
 class AuthService extends StatefulWidget {
+  final AuthInfo authInfo;
   final Widget child;
 
-  const AuthService({required this.child, super.key});
+  /// Shown while the OpenID Connect discovery document is being fetched.
+  /// Defaults to a centered [CircularProgressIndicator].
+  final Widget? loadingWidget;
+
+  /// Called when discovery fails (e.g. Keycloak is unreachable). Receives the
+  /// error and a [retry] callback. Defaults to a simple error card with a
+  /// Retry button.
+  final Widget Function(Object error, VoidCallback retry)? errorBuilder;
+
+  const AuthService({
+    required this.authInfo,
+    required this.child,
+    this.loadingWidget,
+    this.errorBuilder,
+    super.key,
+  });
 
   @override
   State<AuthService> createState() => _AuthState();
-
-  static bool get authRequired => _authRequired;
 
   static Credential? getCreds(BuildContext context) => context
       .dependOnInheritedWidgetOfExactType<_AuthCredentials>()
@@ -214,7 +164,7 @@ class AuthService extends StatefulWidget {
   static bool inRole(BuildContext context, String name) =>
       context
           .dependOnInheritedWidgetOfExactType<_AuthCredentials>()
-          ?._roles
+          ?.roles
           .contains(name) ??
       false;
 
@@ -228,76 +178,143 @@ class AuthService extends StatefulWidget {
       await context.findAncestorStateOfType<_AuthState>()?.requestLogout();
 }
 
+// Tracks whether the OpenID discovery + client setup has completed.
+enum _InitStatus { loading, ready, error }
+
 class _AuthState extends State<AuthService> {
-  UserInfo? userInfo;
+  // ---------------------------------------------------------------------------
+  // Instance state — replaces the old module-level globals
+  // ---------------------------------------------------------------------------
 
-  bool get authenticated => _credentials.value != null;
+  static const List<String> _scopes = ['roles'];
 
-  // Extract user information from the ID token claims (which implement
-  // UserInfo). This avoids a cross-origin GET to the /userinfo endpoint,
-  // eliminating a CORS dependency on the authorization server.
+  _InitStatus _initStatus = _InitStatus.loading;
+  Object? _initError;
 
-  void getUserInfo() {
-    final creds = _credentials.value;
-    if (creds == null) return;
+  Credential? _credential;
+  UserInfo? _userInfo;
 
-    try {
-      setState(() => userInfo = creds.idToken.claims);
-    } catch (err) {
-      dev.log("extracting userInfo from ID token failed: $err");
-    }
-  }
+  // Cached role set — recomputed only when _credential changes, not on every
+  // build() call.
+  Set<String> _roles = const {};
+
+  // Set once discovery succeeds; used by requestLogin / requestLogout.
+  Client? _client;
+
+  AuthInfo get _info => widget.authInfo;
+
+  bool get _authenticated => _credential != null;
+
+  // ---------------------------------------------------------------------------
+  // Lifecycle
+  // ---------------------------------------------------------------------------
 
   @override
   void initState() {
     super.initState();
+    _initialize();
+  }
 
-    // If credentials are already present, extract user info synchronously.
-    // Since the JWT contains the user info, there's no async work needed, and
-    // doing this directly in initState avoids a spurious setState/rebuild cycle.
+  Future<void> _initialize() async {
+    final ai = _info;
+    final uri = Uri.parse('https://ad-auth.fnal.gov/realms/${ai.realm}/');
+    const tmo = Duration(seconds: 2);
 
-    if (authenticated) {
-      try {
-        userInfo = _credentials.value!.idToken.claims;
-      } catch (err) {
-        dev.log("extracting userInfo from ID token failed: $err");
+    try {
+      final issuer = await Issuer.discover(uri).timeout(tmo);
+      final client = Client(issuer, ai.clientId);
+
+      // Check the localStorage cache before triggering a full login flow.
+      final cached = oid.loadCredential(
+        client,
+        audience: ai.audience,
+        scopes: _scopes,
+      );
+
+      if (cached != null) {
+        if (!mounted) return;
+        setState(() {
+          _client = client;
+          _setCredential(cached);
+          _initStatus = _InitStatus.ready;
+        });
+        return;
       }
-    }
 
-    // Listen for changes to global credentials (e.g. from initAuth or other calls)
-    _credentials.addListener(_handleCredsChanged);
-  }
+      // Check whether this page load is the post-login redirect carrying an
+      // authorization code. If so, exchange it for tokens and persist them.
+      final redirectCred = await oid.getRedirectResult(client, scopes: _scopes);
 
-  @override
-  void dispose() {
-    _credentials.removeListener(_handleCredsChanged);
-    super.dispose();
-  }
+      if (!mounted) return;
 
-  void _handleCredsChanged() {
-    if (mounted) {
-      if (authenticated && userInfo == null) {
-        getUserInfo();
-      } else if (!authenticated) {
-        setState(() => userInfo = null);
+      if (redirectCred != null) {
+        oid.saveCredential(
+          redirectCred,
+          audience: ai.audience,
+          scopes: _scopes,
+        );
+        setState(() {
+          _client = client;
+          _setCredential(redirectCred);
+          _initStatus = _InitStatus.ready;
+        });
       } else {
-        setState(() {});
+        setState(() {
+          _client = client;
+          _initStatus = _InitStatus.ready;
+        });
       }
+    } catch (e) {
+      dev.log('OpenID discovery failed: $e', name: 'auth');
+      if (!mounted) return;
+      setState(() {
+        _initError = e;
+        _initStatus = _InitStatus.error;
+      });
     }
   }
+
+  // Sets _credential, _userInfo, and _roles together so they're always in sync.
+  // Must be called inside setState().
+  void _setCredential(Credential cred) {
+    _credential = cred;
+    _userInfo = _tryExtractUserInfo(cred);
+    _roles = _extractRolesFromJwt(
+      cred.response?['access_token'] as String?,
+      _info.clientId,
+    );
+  }
+
+  // Clears credential state together. Must be called inside setState().
+  void _clearCredential() {
+    _credential = null;
+    _userInfo = null;
+    _roles = const {};
+  }
+
+  UserInfo? _tryExtractUserInfo(Credential cred) {
+    try {
+      return cred.idToken.claims;
+    } catch (err) {
+      dev.log('extracting userInfo from ID token failed: $err', name: 'auth');
+      return null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Login / logout
+  // ---------------------------------------------------------------------------
 
   Future<void> requestLogin() async {
-    if (!authenticated) {
-      final creds = await _authenticate();
+    if (_authenticated || _client == null) return;
 
-      // If we successfully get credentials, persist them in the cache and
-      // extract user info.
-
-      if (creds != null) {
-        oid.saveCredential(creds, audience: _audience, scopes: _scopes);
-        userInfo = creds.idToken.claims;
-        _credentials.value = creds;
-      }
+    try {
+      final creds = await oid.authenticate(_client!, scopes: _scopes);
+      if (!mounted) return;
+      oid.saveCredential(creds, audience: _info.audience, scopes: _scopes);
+      setState(() => _setCredential(creds));
+    } catch (e) {
+      dev.log('authentication failed: $e', name: 'auth');
     }
   }
 
@@ -305,38 +322,96 @@ class _AuthState extends State<AuthService> {
   ///
   /// This method will clear out the local credentials, remove the cached
   /// token from localStorage, and request the server invalidate the token.
-
   Future<void> requestLogout() async {
-    if (authenticated) {
-      final Credential tmp = _credentials.value!;
+    if (!_authenticated) return;
 
-      // Remove the cached credential so other apps on the same origin also
-      // see the user as logged out on their next cache check.
-      oid.clearCredential(audience: _audience, scopes: _scopes);
+    final tmp = _credential!;
 
-      Future<void>.microtask(
-        () async => await tmp.revoke().onError(
-          (error, trace) => dev.log("revoke error: $error"),
-        ),
-      );
-      userInfo = null;
-      _credentials.value = null;
-    }
+    oid.clearCredential(audience: _info.audience, scopes: _scopes);
+
+    Future<void>.microtask(
+      () async => await tmp.revoke().onError(
+        (error, trace) => dev.log('revoke error: $error', name: 'auth'),
+      ),
+    );
+
+    if (!mounted) return;
+    setState(_clearCredential);
   }
+
+  // ---------------------------------------------------------------------------
+  // Build
+  // ---------------------------------------------------------------------------
 
   @override
   Widget build(BuildContext context) {
+    return switch (_initStatus) {
+      _InitStatus.loading => _buildLoading(context),
+      _InitStatus.error => _buildError(context),
+      _InitStatus.ready => _buildReady(context),
+    };
+  }
+
+  Widget _buildLoading(BuildContext context) =>
+      widget.loadingWidget ??
+      const Center(child: CircularProgressIndicator.adaptive());
+
+  void _retry() {
+    setState(() => _initStatus = _InitStatus.loading);
+    _initialize();
+  }
+
+  Widget _buildError(BuildContext context) {
+    if (widget.errorBuilder != null) {
+      return widget.errorBuilder!(_initError!, _retry);
+    }
+
+    return Center(
+      child: Card(
+        margin: const EdgeInsets.all(24),
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.cloud_off, size: 48, color: Colors.red),
+              const SizedBox(height: 16),
+              Text(
+                'Authentication service unavailable',
+                style: Theme.of(context).textTheme.titleMedium,
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '$_initError',
+                style: Theme.of(context).textTheme.bodySmall,
+                textAlign: TextAlign.center,
+              ),
+              const SizedBox(height: 16),
+              FilledButton.icon(
+                onPressed: _retry,
+                icon: const Icon(Icons.refresh),
+                label: const Text('Retry'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildReady(BuildContext context) {
     final theme = Theme.of(context);
 
-    if (userInfo != null) {
+    if (_userInfo != null) {
       Future.microtask(() {
         if (context.mounted) {
-          return toastification.show(
+          toastification.show(
             context: context,
             type: .info,
             style: .minimal,
             title: Text(
-              "Notice",
+              'Notice',
               style: theme.textTheme.titleMedium?.copyWith(color: Colors.black),
             ),
             description: Text(
@@ -344,10 +419,10 @@ class _AuthState extends State<AuthService> {
                 color: Colors.black,
                 fontWeight: .bold,
               ),
-              'You are logged in as ${userInfo!.name ?? "UNKNOWN"}.',
+              'You are logged in as ${_userInfo!.name ?? "UNKNOWN"}.',
             ),
             alignment: .topRight,
-            autoCloseDuration: Duration(seconds: 4),
+            autoCloseDuration: const Duration(seconds: 4),
             showProgressBar: false,
             closeButton: const ToastCloseButton(showType: .always),
             closeOnClick: true,
@@ -357,6 +432,11 @@ class _AuthState extends State<AuthService> {
       });
     }
 
-    return _AuthCredentials(userInfo: userInfo, child: widget.child);
+    return _AuthCredentials(
+      credentials: _credential,
+      userInfo: _userInfo,
+      roles: _roles,
+      child: widget.child,
+    );
   }
 }
