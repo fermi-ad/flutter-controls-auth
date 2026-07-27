@@ -9,6 +9,7 @@ import 'dart:developer' as dev;
 
 import 'package:flutter/material.dart';
 import 'package:openid_client/openid_client.dart';
+import 'package:toastification/toastification.dart' show toastification;
 import 'src/openid_browser.dart'
     if (dart.library.io) 'src/openid_io.dart'
     as oid;
@@ -260,10 +261,12 @@ class _AuthState extends State<AuthService> {
 
   void _showAuthError(Object e) {
     // Schedule the toast after the current build frame completes.
+    // Dismiss any queued toasts first so the error isn't buried.
     // scheduleFrame() is required on desktop: Flutter won't render a new frame
     // without user input when idle, so the postFrameCallback would never fire.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
+        toastification.dismissAll(delayForAnimation: false);
         errorBox(
           context,
           'Authentication Unavailable',
