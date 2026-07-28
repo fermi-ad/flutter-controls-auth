@@ -5,17 +5,18 @@
 library;
 
 import 'dart:convert';
-import 'dart:async';
 import 'dart:developer' as dev;
 
 import 'package:flutter/material.dart';
 import 'package:openid_client/openid_client.dart';
-import 'package:toastification/toastification.dart';
+import 'package:toastification/toastification.dart' show toastification;
 import 'src/openid_browser.dart'
     if (dart.library.io) 'src/openid_io.dart'
     as oid;
+import 'src/message_boxes.dart' show errorBox, infoBox;
 
 export 'package:openid_client/openid_client.dart' show Credential, UserInfo;
+export 'src/message_boxes.dart' show errorBox, infoBox, warningBox;
 
 /// Defines the authorization information required by the application. This
 /// is the one structure that applications will use.
@@ -36,80 +37,8 @@ class AuthInfo {
   });
 }
 
-// These are global resources for the module. Applications cannot have more
-// than one set of credentials.
-
-final ValueNotifier<Credential?> _credentials = ValueNotifier(null);
-Future<Credential?> Function() _authenticate = () async => null;
-bool _authRequired = false;
-String? _clientId;
-String? _audience;
-List<String> _scopes = const [];
-
-Future<void> initAuth(AuthInfo ai) async {
-  final uri = Uri.parse('https://ad-auth.fnal.gov/realms/${ai.realm}/');
-  const Duration tmo = Duration(seconds: 2);
-  const List<String> scopes = ["roles"];
-
-  _authRequired = true;
-  _clientId = ai.clientId;
-  _audience = ai.audience;
-  _scopes = scopes;
-
-  final issuer = await Issuer.discover(uri).timeout(tmo);
-  final Client client = Client(issuer, ai.clientId);
-
-  // Always set up the authenticate closure first so requestLogin() works
-  // regardless of whether a cached credential is found below.
-
-  _authenticate = () async {
-    if (_credentials.value == null) {
-      try {
-        // No timeout here: on mobile/desktop the user must interact with an
-        // external browser, which can take an arbitrary amount of time. On the
-        // web platform authenticate() triggers a page redirect and the returned
-        // future never completes, so a timeout would be meaningless there too.
-        return await oid.authenticate(client, scopes: scopes);
-      } catch (e) {
-        dev.log('authentication failed: $e', name: "auth");
-        return null;
-      }
-    } else {
-      return _credentials.value;
-    }
-  };
-
-  // On the web platform, check the localStorage cache before triggering a
-  // full login flow. A cached, non-expired token for this audience + scope
-  // set means the user already authenticated in another app on the same
-  // origin — no redirect needed.
-
-  final cached = oid.loadCredential(
-    client,
-    audience: ai.audience,
-    scopes: scopes,
-  );
-
-  if (cached != null) {
-    _credentials.value = cached;
-    return;
-  }
-
-  // Check whether this page load is the post-login redirect carrying an
-  // authorization code. If so, exchange it for tokens and persist them.
-
-  final redirectCred = await oid.getRedirectResult(client, scopes: scopes);
-
-  if (redirectCred != null) {
-    oid.saveCredential(redirectCred, audience: ai.audience, scopes: scopes);
-    _credentials.value = redirectCred;
-  }
-}
-
 String _base64UrlDecode(String base64Url) {
-  String normalized = base64Url
-      .replaceAll('-', '+') // Convert URL-safe characters back
-      .replaceAll('_', '/');
+  String normalized = base64Url.replaceAll('-', '+').replaceAll('_', '/');
 
   switch (normalized.length % 4) {
     case 2:
@@ -165,14 +94,14 @@ Set<String> _extractRolesFromJwt(String? jwt, String? clientId) {
 class _AuthCredentials extends InheritedWidget {
   final Credential? credentials;
   final UserInfo? userInfo;
-  final Set<String> _roles;
+  final Set<String> roles;
 
-  _AuthCredentials({this.userInfo, required super.child})
-    : credentials = _credentials.value,
-      _roles = _extractRolesFromJwt(
-        _credentials.value?.response?['access_token'] as String?,
-        _clientId,
-      );
+  const _AuthCredentials({
+    required this.credentials,
+    required this.userInfo,
+    required this.roles,
+    required super.child,
+  });
 
   @override
   bool updateShouldNotify(covariant _AuthCredentials oldWidget) =>
@@ -181,21 +110,31 @@ class _AuthCredentials extends InheritedWidget {
 
 /// Provides authentication services.
 ///
-/// This widget should be placed near the Scaffold of an application to minimize
-/// updates. Each update may trigger a new sign-on session. When this widget is
-/// created, the application isn't automatically authenticated. To initiate
-/// authentication, the [requestAuthentication] method should be called. This
-/// allows an application to run with limited features when not authenticated.
-
+/// Place this widget near the root of your application (inside
+/// [ToastificationWrapper] if you use toastification). Pass your [AuthInfo]
+/// directly — there is no separate `initAuth()` call required.
+///
+/// The widget renders immediately with no network calls. Keycloak is only
+/// contacted when the user explicitly calls [requestLogin], or on web when
+/// the page load is the post-login redirect carrying an authorization code.
+/// If Keycloak is unreachable, an [errorBox] toast is shown at that point;
+/// the app continues to function for unprivileged use.
+///
+/// Example:
+/// ```dart
+/// AuthService(
+///   authInfo: AuthInfo(clientId: 'my-app'),
+///   child: MyApp(),
+/// )
+/// ```
 class AuthService extends StatefulWidget {
+  final AuthInfo authInfo;
   final Widget child;
 
-  const AuthService({required this.child, super.key});
+  const AuthService({required this.authInfo, required this.child, super.key});
 
   @override
   State<AuthService> createState() => _AuthState();
-
-  static bool get authRequired => _authRequired;
 
   static Credential? getCreds(BuildContext context) => context
       .dependOnInheritedWidgetOfExactType<_AuthCredentials>()
@@ -212,7 +151,7 @@ class AuthService extends StatefulWidget {
   static bool inRole(BuildContext context, String name) =>
       context
           .dependOnInheritedWidgetOfExactType<_AuthCredentials>()
-          ?._roles
+          ?.roles
           .contains(name) ??
       false;
 
@@ -227,75 +166,192 @@ class AuthService extends StatefulWidget {
 }
 
 class _AuthState extends State<AuthService> {
-  UserInfo? userInfo;
+  // ---------------------------------------------------------------------------
+  // Instance state
+  // ---------------------------------------------------------------------------
 
-  bool get authenticated => _credentials.value != null;
+  static const List<String> _scopes = ['roles'];
 
-  // Extract user information from the ID token claims (which implement
-  // UserInfo). This avoids a cross-origin GET to the /userinfo endpoint,
-  // eliminating a CORS dependency on the authorization server.
+  Credential? _credential;
+  UserInfo? _userInfo;
 
-  void getUserInfo() {
-    final creds = _credentials.value;
-    if (creds == null) return;
+  // Cached role set — recomputed only when _credential changes, not on every
+  // build() call.
+  Set<String> _roles = const {};
 
-    try {
-      setState(() => userInfo = creds.idToken.claims);
-    } catch (err) {
-      dev.log("extracting userInfo from ID token failed: $err");
-    }
-  }
+  // Lazily set on first successful Issuer.discover(); reused for all
+  // subsequent login attempts.
+  Client? _client;
+
+  AuthInfo get _info => widget.authInfo;
+
+  bool get _authenticated => _credential != null;
+
+  // ---------------------------------------------------------------------------
+  // Lifecycle
+  // ---------------------------------------------------------------------------
 
   @override
   void initState() {
     super.initState();
+    _initialize();
+  }
 
-    // If credentials are already present, extract user info synchronously.
-    // Since the JWT contains the user info, there's no async work needed, and
-    // doing this directly in initState avoids a spurious setState/rebuild cycle.
-
-    if (authenticated) {
-      try {
-        userInfo = _credentials.value!.idToken.claims;
-      } catch (err) {
-        dev.log("extracting userInfo from ID token failed: $err");
-      }
+  // Runs at startup with zero network calls unless a redirect code is present.
+  Future<void> _initialize() async {
+    // On web: if this page load is the post-login redirect (URL contains
+    // ?code=...), we must exchange the code immediately — it expires quickly.
+    // In every other case we skip discovery entirely and let the app render.
+    if (!oid.hasRedirectCode()) {
+      // No redirect code. Check localStorage for a cached token (no network).
+      // We need a Client to reconstruct the Credential object, but we can
+      // build a stub issuer from the well-known URL without fetching it —
+      // loadCredential only needs the client to call client.createCredential(),
+      // which is a pure local operation. However, the openid_client library
+      // requires a real Issuer, so we must discover lazily here only if cached.
+      //
+      // Simpler: just skip the cache check at startup and let the user log in
+      // normally. The cache is an optimisation for web SSO; on native there is
+      // no cache at all. If the user has a cached token the login flow will
+      // find it via loadCredential() inside _ensureClient().
+      return;
     }
 
-    // Listen for changes to global credentials (e.g. from initAuth or other calls)
-    _credentials.addListener(_handleCredsChanged);
-  }
+    // Redirect code present — must discover and exchange now.
+    final client = await _ensureClient();
+    if (client == null || !mounted) return;
 
-  @override
-  void dispose() {
-    _credentials.removeListener(_handleCredsChanged);
-    super.dispose();
-  }
+    try {
+      final redirectCred = await oid.getRedirectResult(client, scopes: _scopes);
+      if (!mounted) return;
 
-  void _handleCredsChanged() {
-    if (mounted) {
-      if (authenticated && userInfo == null) {
-        getUserInfo();
-      } else if (!authenticated) {
-        setState(() => userInfo = null);
-      } else {
-        setState(() {});
+      if (redirectCred != null) {
+        oid.saveCredential(
+          redirectCred,
+          audience: _info.audience,
+          scopes: _scopes,
+        );
+        setState(() => _setCredential(redirectCred));
       }
+    } catch (e) {
+      dev.log('redirect token exchange failed: $e', name: 'auth');
+      if (mounted) _showAuthError(e);
     }
   }
+
+  /// Ensures [_client] is set, performing [Issuer.discover()] if needed.
+  /// Returns the client on success, or `null` if discovery fails (in which
+  /// case an error toast has already been shown).
+  Future<Client?> _ensureClient() async {
+    if (_client != null) return _client;
+
+    final uri = Uri.parse('https://ad-auth.fnal.gov/realms/${_info.realm}/');
+    const tmo = Duration(seconds: 5);
+
+    try {
+      final issuer = await Issuer.discover(uri).timeout(tmo);
+      _client = Client(issuer, _info.clientId);
+      return _client;
+    } catch (e) {
+      dev.log('OpenID discovery failed: $e', name: 'auth');
+      if (mounted) _showAuthError(e);
+      return null;
+    }
+  }
+
+  void _showAuthError(Object e) {
+    // Schedule the toast after the current build frame completes.
+    // Dismiss any queued toasts first so the error isn't buried.
+    // scheduleFrame() is required on desktop: Flutter won't render a new frame
+    // without user input when idle, so the postFrameCallback would never fire.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        toastification.dismissAll(delayForAnimation: false);
+        errorBox(
+          context,
+          'Authentication Unavailable',
+          'Could not reach the authentication service. '
+              'Some features may be disabled.',
+          duration: const Duration(seconds: 8),
+        );
+      }
+    });
+    WidgetsBinding.instance.scheduleFrame();
+  }
+
+  // Sets _credential, _userInfo, and _roles together so they're always in sync.
+  // Must be called inside setState(). Shows the "logged in" toast once.
+  void _setCredential(Credential cred) {
+    _credential = cred;
+    _userInfo = _tryExtractUserInfo(cred);
+    _roles = _extractRolesFromJwt(
+      cred.response?['access_token'] as String?,
+      _info.clientId,
+    );
+
+    // Show the login toast after the frame that triggered this setState().
+    // scheduleFrame() is required on desktop: Flutter won't render a new frame
+    // without user input when idle, so the postFrameCallback would never fire.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _userInfo != null) {
+        infoBox(
+          context,
+          'Notice',
+          'You are logged in as ${_userInfo!.name ?? "UNKNOWN"}.',
+        );
+      }
+    });
+    WidgetsBinding.instance.scheduleFrame();
+  }
+
+  // Clears credential state together. Must be called inside setState().
+  void _clearCredential() {
+    _credential = null;
+    _userInfo = null;
+    _roles = const {};
+  }
+
+  UserInfo? _tryExtractUserInfo(Credential cred) {
+    try {
+      return cred.idToken.claims;
+    } catch (err) {
+      dev.log('extracting userInfo from ID token failed: $err', name: 'auth');
+      return null;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Login / logout
+  // ---------------------------------------------------------------------------
 
   Future<void> requestLogin() async {
-    if (!authenticated) {
-      final creds = await _authenticate();
+    if (_authenticated) return;
 
-      // If we successfully get credentials, persist them in the cache and
-      // extract user info.
+    final client = await _ensureClient();
+    if (client == null || !mounted) return;
 
-      if (creds != null) {
-        oid.saveCredential(creds, audience: _audience, scopes: _scopes);
-        userInfo = creds.idToken.claims;
-        _credentials.value = creds;
-      }
+    // Check the localStorage cache before triggering a full login flow. A
+    // cached, non-expired token means the user already authenticated in another
+    // app on the same origin — no redirect needed.
+    final cached = oid.loadCredential(
+      client,
+      audience: _info.audience,
+      scopes: _scopes,
+    );
+
+    if (cached != null) {
+      if (!mounted) return;
+      setState(() => _setCredential(cached));
+      return;
+    }
+
+    try {
+      final creds = await oid.authenticate(client, scopes: _scopes);
+      if (!mounted) return;
+      oid.saveCredential(creds, audience: _info.audience, scopes: _scopes);
+      setState(() => _setCredential(creds));
+    } catch (e) {
+      dev.log('authentication failed: $e', name: 'auth');
     }
   }
 
@@ -303,58 +359,32 @@ class _AuthState extends State<AuthService> {
   ///
   /// This method will clear out the local credentials, remove the cached
   /// token from localStorage, and request the server invalidate the token.
-
   Future<void> requestLogout() async {
-    if (authenticated) {
-      final Credential tmp = _credentials.value!;
+    if (!_authenticated) return;
 
-      // Remove the cached credential so other apps on the same origin also
-      // see the user as logged out on their next cache check.
-      oid.clearCredential(audience: _audience, scopes: _scopes);
+    final tmp = _credential!;
 
-      Future<void>.microtask(
-        () async => await tmp.revoke().onError(
-          (error, trace) => dev.log("revoke error: $error"),
-        ),
-      );
-      userInfo = null;
-      _credentials.value = null;
-    }
+    oid.clearCredential(audience: _info.audience, scopes: _scopes);
+
+    Future<void>.microtask(
+      () async => await tmp.revoke().onError(
+        (error, trace) => dev.log('revoke error: $error', name: 'auth'),
+      ),
+    );
+
+    if (!mounted) return;
+    setState(_clearCredential);
   }
+
+  // ---------------------------------------------------------------------------
+  // Build
+  // ---------------------------------------------------------------------------
 
   @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-
-    if (userInfo != null) {
-      Future.microtask(() {
-        if (context.mounted) {
-          return toastification.show(
-            context: context,
-            type: .info,
-            style: .minimal,
-            title: Text(
-              "Notice",
-              style: theme.textTheme.titleMedium?.copyWith(color: Colors.black),
-            ),
-            description: Text(
-              style: theme.textTheme.bodyMedium?.copyWith(
-                color: Colors.black,
-                fontWeight: .bold,
-              ),
-              'You are logged in as ${userInfo!.name ?? "UNKNOWN"}.',
-            ),
-            alignment: .topRight,
-            autoCloseDuration: Duration(seconds: 4),
-            showProgressBar: false,
-            closeButton: const ToastCloseButton(showType: .always),
-            closeOnClick: true,
-            dragToClose: true,
-          );
-        }
-      });
-    }
-
-    return _AuthCredentials(userInfo: userInfo, child: widget.child);
-  }
+  Widget build(BuildContext context) => _AuthCredentials(
+    credentials: _credential,
+    userInfo: _userInfo,
+    roles: _roles,
+    child: widget.child,
+  );
 }
