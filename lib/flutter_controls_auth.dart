@@ -179,6 +179,11 @@ class AuthService extends StatefulWidget {
   static UserInfo? getUserInfo(BuildContext context) =>
       context.dependOnInheritedWidgetOfExactType<_AuthCredentials>()?.userInfo;
 
+  /// Returns the expiry time of the JWT access token, or `null` if the user
+  /// is not logged in, the token is absent, or the token has no `exp` claim.
+  static DateTime? getJwtExpiry(BuildContext context) =>
+      _jwtExpiry(getJwt(context));
+
   static Future<void> requestLogin(BuildContext context) async =>
       await context.findAncestorStateOfType<_AuthState>()?.requestLogin();
 
