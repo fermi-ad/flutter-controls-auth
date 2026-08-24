@@ -4,10 +4,12 @@
 /// widgets and types are used by our other packages.
 library;
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:developer' as dev;
 
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:openid_client/openid_client.dart';
 import 'package:toastification/toastification.dart' show toastification;
 import 'src/openid_browser.dart'
@@ -48,6 +50,25 @@ String _base64UrlDecode(String base64Url) {
   }
 
   return utf8.decode(base64Decode(normalized));
+}
+
+// Parses the `exp` claim from a JWT access token and returns the expiry as a
+// [DateTime]. Returns `null` if the token is absent, malformed, or has no
+// `exp` claim.
+DateTime? _jwtExpiry(String? jwt) {
+  try {
+    if (jwt?.split('.') case [_, final payload, _]) {
+      final dec = jsonDecode(_base64UrlDecode(payload));
+
+      if (dec case {'exp': final num exp}) {
+        return DateTime.fromMillisecondsSinceEpoch(
+          (exp * 1000).toInt(),
+          isUtc: true,
+        );
+      }
+    }
+  } catch (_) {}
+  return null;
 }
 
 // Extracts the roles from the JWT. Although the application has access to the
@@ -172,6 +193,9 @@ class _AuthState extends State<AuthService> {
 
   static const List<String> _scopes = ['roles'];
 
+  // How far before token expiry to fire the renewal timer.
+  static const _renewalLeadTime = Duration(minutes: 2);
+
   Credential? _credential;
   UserInfo? _userInfo;
 
@@ -182,6 +206,9 @@ class _AuthState extends State<AuthService> {
   // Lazily set on first successful Issuer.discover(); reused for all
   // subsequent login attempts.
   Client? _client;
+
+  // Background renewal timer — cancelled on logout / dispose.
+  Timer? _renewalTimer;
 
   AuthInfo get _info => widget.authInfo;
 
@@ -195,6 +222,12 @@ class _AuthState extends State<AuthService> {
   void initState() {
     super.initState();
     _initialize();
+  }
+
+  @override
+  void dispose() {
+    _renewalTimer?.cancel();
+    super.dispose();
   }
 
   // Runs at startup with zero network calls unless a redirect code is present.
@@ -231,7 +264,7 @@ class _AuthState extends State<AuthService> {
           audience: _info.audience,
           scopes: _scopes,
         );
-        setState(() => _setCredential(redirectCred));
+        setState(() => _setCredential(redirectCred, showToast: true));
       }
     } catch (e) {
       dev.log('redirect token exchange failed: $e', name: 'auth');
@@ -260,10 +293,10 @@ class _AuthState extends State<AuthService> {
   }
 
   void _showAuthError(Object e) {
-    // Schedule the toast after the current build frame completes.
-    // Dismiss any queued toasts first so the error isn't buried.
-    // scheduleFrame() is required on desktop: Flutter won't render a new frame
-    // without user input when idle, so the postFrameCallback would never fire.
+    // Schedule the toast after the current build frame completes. Dismiss any
+    // queued toasts first so the error isn't buried. scheduleFrame() is
+    // required on desktop: Flutter won't render a new frame without user input
+    // when idle, so the postFrameCallback would never fire.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         toastification.dismissAll(delayForAnimation: false);
@@ -280,35 +313,166 @@ class _AuthState extends State<AuthService> {
   }
 
   // Sets _credential, _userInfo, and _roles together so they're always in sync.
-  // Must be called inside setState(). Shows the "logged in" toast once.
-  void _setCredential(Credential cred) {
+  // Must be called inside setState(). Pass [showToast] = true only on an
+  // explicit user-initiated login — silent background renewals should not
+  // re-announce the user.
+  void _setCredential(Credential cred, {bool showToast = false}) {
     _credential = cred;
     _userInfo = _tryExtractUserInfo(cred);
     _roles = _extractRolesFromJwt(
       cred.response?['access_token'] as String?,
       _info.clientId,
     );
+    _scheduleRenewal(cred);
 
-    // Show the login toast after the frame that triggered this setState().
-    // scheduleFrame() is required on desktop: Flutter won't render a new frame
-    // without user input when idle, so the postFrameCallback would never fire.
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && _userInfo != null) {
-        infoBox(
-          context,
-          'Notice',
-          'You are logged in as ${_userInfo!.name ?? "UNKNOWN"}.',
-        );
-      }
-    });
-    WidgetsBinding.instance.scheduleFrame();
+    if (showToast) {
+      // Show the login toast after the frame that triggered this setState().
+      // scheduleFrame() is required on desktop: Flutter won't render a new
+      // frame without user input when idle, so the postFrameCallback would
+      // never fire.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _userInfo != null) {
+          infoBox(
+            context,
+            'Notice',
+            'You are logged in as ${_userInfo!.name ?? "UNKNOWN"}.',
+          );
+        }
+      });
+      WidgetsBinding.instance.scheduleFrame();
+    }
   }
 
   // Clears credential state together. Must be called inside setState().
   void _clearCredential() {
+    _renewalTimer?.cancel();
+    _renewalTimer = null;
     _credential = null;
     _userInfo = null;
     _roles = const {};
+  }
+
+  // ---------------------------------------------------------------------------
+  // Token renewal
+  // ---------------------------------------------------------------------------
+
+  // Arms (or re-arms) the background renewal timer based on the access token's
+  // `exp` claim. Fires [_renewalLeadTime] before expiry. If the token has no
+  // `exp` claim, or expiry is already past (or too close), the timer is not
+  // set — the user will simply need to log in again.
+  void _scheduleRenewal(Credential cred) {
+    _renewalTimer?.cancel();
+    _renewalTimer = null;
+
+    final jwt = cred.response?['access_token'] as String?;
+    final expiry = _jwtExpiry(jwt);
+
+    if (expiry == null) return;
+
+    final fireAt = expiry.subtract(_renewalLeadTime);
+    final delay = fireAt.difference(DateTime.now().toUtc());
+
+    if (delay <= Duration.zero) {
+      // Token is already expired or too close to expiry — attempt renewal now.
+      _renewToken(cred);
+    } else {
+      dev.log(
+        'renewal scheduled in ${delay.inSeconds}s '
+        '(token expires at ${expiry.toIso8601String()})',
+        name: 'auth',
+      );
+
+      _renewalTimer = Timer(delay, () => _renewToken(cred));
+    }
+  }
+
+  // Exchanges the refresh token for a new access token via Keycloak's token
+  // endpoint. On success the new credential is persisted and state is updated.
+  // On failure the error is logged; the user will be asked to log in again when
+  // the current token eventually expires.
+  Future<void> _renewToken(Credential cred) async {
+    final refreshToken = cred.response?['refresh_token'] as String?;
+
+    if (refreshToken == null) {
+      dev.log('no refresh token available — skipping renewal', name: 'auth');
+      return;
+    }
+
+    final client = await _ensureClient();
+
+    if (client == null) return;
+
+    final tokenEndpoint = client.issuer.metadata.tokenEndpoint;
+
+    if (tokenEndpoint == null) {
+      dev.log('token endpoint not available — skipping renewal', name: 'auth');
+      return;
+    }
+
+    dev.log('renewing token in background', name: 'auth');
+
+    try {
+      final response = await http.post(
+        tokenEndpoint,
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: {
+          'grant_type': 'refresh_token',
+          'client_id': _info.clientId,
+          'refresh_token': refreshToken,
+        },
+      );
+
+      if (response.statusCode != 200) {
+        dev.log(
+          'token renewal failed: HTTP ${response.statusCode}',
+          name: 'auth',
+        );
+        if (mounted) _showRenewalError(cred);
+        return;
+      }
+
+      final Map<String, dynamic> body = (jsonDecode(response.body) as Map)
+          .cast<String, dynamic>();
+
+      final newCred = client.createCredential(
+        accessToken: body['access_token'] as String? ?? '',
+        idToken: body['id_token'] as String?,
+        refreshToken: body['refresh_token'] as String? ?? refreshToken,
+        tokenType: body['token_type'] as String? ?? 'Bearer',
+      );
+
+      oid.saveCredential(newCred, audience: _info.audience, scopes: _scopes);
+
+      if (!mounted) return;
+
+      setState(() => _setCredential(newCred));
+
+      dev.log('token renewed successfully', name: 'auth');
+    } catch (e) {
+      dev.log('token renewal error: $e', name: 'auth');
+      if (mounted) _showRenewalError(cred);
+    }
+  }
+
+  void _showRenewalError(Credential cred) {
+    final jwt = cred.response?['access_token'] as String?;
+    final expiry = _jwtExpiry(jwt);
+    final expiryMsg = expiry != null
+        ? 'Current token expires at ${expiry.toLocal()}.'
+        : 'Current token expiry is unknown.';
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        toastification.dismissAll(delayForAnimation: false);
+        errorBox(
+          context,
+          'Token Renewal Failed',
+          'Could not renew your session. $expiryMsg',
+          duration: const Duration(seconds: 10),
+        );
+      }
+    });
+    WidgetsBinding.instance.scheduleFrame();
   }
 
   UserInfo? _tryExtractUserInfo(Credential cred) {
@@ -341,7 +505,7 @@ class _AuthState extends State<AuthService> {
 
     if (cached != null) {
       if (!mounted) return;
-      setState(() => _setCredential(cached));
+      setState(() => _setCredential(cached, showToast: true));
       return;
     }
 
@@ -349,7 +513,7 @@ class _AuthState extends State<AuthService> {
       final creds = await oid.authenticate(client, scopes: _scopes);
       if (!mounted) return;
       oid.saveCredential(creds, audience: _info.audience, scopes: _scopes);
-      setState(() => _setCredential(creds));
+      setState(() => _setCredential(creds, showToast: true));
     } catch (e) {
       dev.log('authentication failed: $e', name: 'auth');
     }

@@ -13,6 +13,7 @@ dependencies:
 
     # Needed for KeyCloak authentication support.
 
+  http: ^1.2.0
   openid_client: ^0.4.8
   url_launcher: ^6.2.1
   web: ^1.1.1
