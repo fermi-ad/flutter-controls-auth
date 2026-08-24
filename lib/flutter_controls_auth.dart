@@ -152,7 +152,25 @@ class AuthService extends StatefulWidget {
   final AuthInfo authInfo;
   final Widget child;
 
-  const AuthService({required this.authInfo, required this.child, super.key});
+  /// Overrides the OpenID [Client] used for token operations. Only set this
+  /// in tests — production code always passes `null` so that [_AuthState]
+  /// performs real [Issuer.discover()] on first use.
+  @visibleForTesting
+  final Client? oidClient;
+
+  /// Overrides the [http.Client] used for token-endpoint requests. Only set
+  /// this in tests — production code always passes `null` so that
+  /// [_AuthState] uses the default [http.Client].
+  @visibleForTesting
+  final http.Client? httpClient;
+
+  const AuthService({
+    required this.authInfo,
+    required this.child,
+    super.key,
+    this.oidClient,
+    this.httpClient,
+  });
 
   @override
   State<AuthService> createState() => _AuthState();
@@ -214,6 +232,11 @@ class _AuthState extends State<AuthService> {
 
   // Background renewal timer — cancelled on logout / dispose.
   Timer? _renewalTimer;
+
+  // Monotonically increasing counter. Incremented on every logout so that
+  // any in-flight _renewToken() call can detect that the session it was
+  // renewing is no longer active and discard its result.
+  int _sessionGeneration = 0;
 
   AuthInfo get _info => widget.authInfo;
 
@@ -281,6 +304,8 @@ class _AuthState extends State<AuthService> {
   /// Returns the client on success, or `null` if discovery fails (in which
   /// case an error toast has already been shown).
   Future<Client?> _ensureClient() async {
+    // Allow tests to inject a pre-built Client, bypassing network discovery.
+    if (widget.oidClient != null) return _client = widget.oidClient;
     if (_client != null) return _client;
 
     final uri = Uri.parse('https://ad-auth.fnal.gov/realms/${_info.realm}/');
@@ -348,8 +373,15 @@ class _AuthState extends State<AuthService> {
     }
   }
 
+  /// Seeds the widget with [cred] as if the user had just logged in.
+  /// Only call this from tests — it bypasses the normal login flow.
+  @visibleForTesting
+  void setCredentialForTest(Credential cred) => _setCredential(cred);
+
   // Clears credential state together. Must be called inside setState().
   void _clearCredential() {
+    // Bump the generation so any in-flight _renewToken() discards its result.
+    _sessionGeneration++;
     _renewalTimer?.cancel();
     _renewalTimer = null;
     _credential = null;
@@ -393,9 +425,13 @@ class _AuthState extends State<AuthService> {
 
   // Exchanges the refresh token for a new access token via Keycloak's token
   // endpoint. On success the new credential is persisted and state is updated.
-  // On failure the error is logged; the user will be asked to log in again when
-  // the current token eventually expires.
+  // On failure the credential is left in place until it expires, at which
+  // point it is cleared so that requestLogin() can recover.
   Future<void> _renewToken(Credential cred) async {
+    // Capture the session generation before any await so we can detect a
+    // logout that occurs while the HTTP request is in flight.
+    final generation = _sessionGeneration;
+
     final refreshToken = cred.response?['refresh_token'] as String?;
 
     if (refreshToken == null) {
@@ -417,7 +453,8 @@ class _AuthState extends State<AuthService> {
     dev.log('renewing token in background', name: 'auth');
 
     try {
-      final response = await http.post(
+      final httpClient = widget.httpClient ?? http.Client();
+      final response = await httpClient.post(
         tokenEndpoint,
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
         body: {
@@ -427,12 +464,16 @@ class _AuthState extends State<AuthService> {
         },
       );
 
+      // If the session was invalidated (logout) while we were waiting, discard
+      // the response entirely — do not restore credentials or touch storage.
+      if (_sessionGeneration != generation) return;
+
       if (response.statusCode != 200) {
         dev.log(
           'token renewal failed: HTTP ${response.statusCode}',
           name: 'auth',
         );
-        if (mounted) _showRenewalError(cred);
+        if (mounted) _handleRenewalFailure(cred, generation);
         return;
       }
 
@@ -444,6 +485,9 @@ class _AuthState extends State<AuthService> {
         idToken: body['id_token'] as String?,
         refreshToken: body['refresh_token'] as String? ?? refreshToken,
         tokenType: body['token_type'] as String? ?? 'Bearer',
+        expiresIn: body['expires_in'] is num
+            ? Duration(seconds: (body['expires_in'] as num).toInt())
+            : null,
       );
 
       oid.saveCredential(newCred, audience: _info.audience, scopes: _scopes);
@@ -455,13 +499,36 @@ class _AuthState extends State<AuthService> {
       dev.log('token renewed successfully', name: 'auth');
     } catch (e) {
       dev.log('token renewal error: $e', name: 'auth');
-      if (mounted) _showRenewalError(cred);
+      if (mounted && _sessionGeneration == generation) {
+        _handleRenewalFailure(cred, generation);
+      }
     }
   }
 
-  void _showRenewalError(Credential cred) {
+  // Shows the renewal-error toast and schedules a post-expiry timer that
+  // clears the (now-stale) credential so requestLogin() can recover.
+  // [generation] must be the session generation captured before the HTTP
+  // request so that a subsequent logout or successful renewal cancels the
+  // clear timer.
+  void _handleRenewalFailure(Credential cred, int generation) {
     final jwt = cred.response?['access_token'] as String?;
     final expiry = _jwtExpiry(jwt);
+
+    _showRenewalError(expiry);
+
+    final delay = expiry != null
+        ? expiry.difference(DateTime.now().toUtc())
+        : Duration.zero;
+
+    // Schedule a clear at (or immediately after) token expiry so the widget
+    // stops reporting the user as authenticated once the token is unusable.
+    Timer(delay > Duration.zero ? delay : Duration.zero, () {
+      if (!mounted || _sessionGeneration != generation) return;
+      setState(_clearCredential);
+    });
+  }
+
+  void _showRenewalError(DateTime? expiry) {
     final expiryMsg = expiry != null
         ? 'Current token expires at ${expiry.toLocal()}.'
         : 'Current token expiry is unknown.';
