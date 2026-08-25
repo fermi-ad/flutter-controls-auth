@@ -337,7 +337,7 @@ void main() {
     });
 
     testWidgets(
-      'renewed credential response includes expires_in from token endpoint',
+      'renewed credential response includes expiry metadata for persistence',
       (tester) async {
         const newExpiresIn = 7200;
         final newExpEpoch =
@@ -404,7 +404,162 @@ void main() {
           reason:
               'Renewed credential must carry expires_in from the token response',
         );
+        expect(
+          renewedCred.response?['expires_at'],
+          isA<int>(),
+          reason:
+              'Renewed credential must carry expires_at for browser persistence',
+        );
       },
     );
   }); // end P2 group
+
+  group('renewal response validation', () {
+    testWidgets(
+      'does not install a credential when a 200 response omits access_token',
+      (tester) async {
+        final client = _stubClient();
+        final mockHttp = MockClient((_) async => http.Response('{}', 200));
+        final oldCredential = _credWithExpiry(
+          client,
+          _renewalLeadTime + const Duration(seconds: 10),
+        );
+        late BuildContext capturedCtx;
+
+        await tester.pumpWidget(
+          _wrap(
+            AuthService(
+              authInfo: const AuthInfo(clientId: 'test-client'),
+              oidClient: client,
+              httpClient: mockHttp,
+              child: Builder(
+                builder: (ctx) {
+                  capturedCtx = ctx;
+                  return const SizedBox.shrink();
+                },
+              ),
+            ),
+          ),
+        );
+        final state =
+            tester.state<State<StatefulWidget>>(find.byType(AuthService))
+                as dynamic;
+        state.setState(() => state.setCredentialForTest(oldCredential));
+        await tester.pump(const Duration(seconds: 11));
+        await tester.pumpAndSettle();
+
+        expect(AuthService.getCreds(capturedCtx), same(oldCredential));
+
+        // The malformed response is handled as a failed renewal. Advance past
+        // expiry so the failure cleanup timer and error toast are also settled.
+        await tester.pump(const Duration(minutes: 2, seconds: 11));
+        await tester.pumpAndSettle();
+      },
+    );
+
+    testWidgets('rejects a 200 refresh response with invalid expires_in', (
+      tester,
+    ) async {
+      final client = _stubClient();
+      final accessToken = _makeJwt(
+        expEpochSeconds:
+            DateTime.now()
+                .toUtc()
+                .add(const Duration(hours: 1))
+                .millisecondsSinceEpoch ~/
+            1000,
+      );
+      final mockHttp = MockClient(
+        (_) async => http.Response(
+          jsonEncode({
+            'access_token': accessToken,
+            'refresh_token': 'new-refresh',
+            'expires_in': 'not-a-duration',
+          }),
+          200,
+        ),
+      );
+      final oldCredential = _credWithExpiry(
+        client,
+        _renewalLeadTime + const Duration(seconds: 10),
+      );
+      late BuildContext capturedCtx;
+
+      await tester.pumpWidget(
+        _wrap(
+          AuthService(
+            authInfo: const AuthInfo(clientId: 'test-client'),
+            oidClient: client,
+            httpClient: mockHttp,
+            child: Builder(
+              builder: (ctx) {
+                capturedCtx = ctx;
+                return const SizedBox.shrink();
+              },
+            ),
+          ),
+        ),
+      );
+      final state =
+          tester.state<State<StatefulWidget>>(find.byType(AuthService))
+              as dynamic;
+      state.setState(() => state.setCredentialForTest(oldCredential));
+      await tester.pump(const Duration(seconds: 11));
+      await tester.pumpAndSettle();
+
+      expect(AuthService.getCreds(capturedCtx), same(oldCredential));
+      await tester.pump(const Duration(minutes: 2, seconds: 11));
+      await tester.pumpAndSettle();
+    });
+
+    testWidgets(
+      'requestLogin is usable after failed renewal clears the credential',
+      (tester) async {
+        final client = _stubClient();
+        final mockHttp = MockClient((_) async => http.Response('failure', 500));
+        final replacement = _credWithExpiry(client, const Duration(hours: 1));
+        var loginCalls = 0;
+        late BuildContext capturedCtx;
+
+        await tester.pumpWidget(
+          _wrap(
+            AuthService(
+              authInfo: const AuthInfo(clientId: 'test-client'),
+              oidClient: client,
+              httpClient: mockHttp,
+              authenticateForTest: (_) async {
+                loginCalls++;
+                return replacement;
+              },
+              child: Builder(
+                builder: (ctx) {
+                  capturedCtx = ctx;
+                  return const SizedBox.shrink();
+                },
+              ),
+            ),
+          ),
+        );
+        final state =
+            tester.state<State<StatefulWidget>>(find.byType(AuthService))
+                as dynamic;
+        final oldCredential = _credWithExpiry(
+          client,
+          _renewalLeadTime + const Duration(seconds: 10),
+        );
+        state.setState(() => state.setCredentialForTest(oldCredential));
+        await tester.pump(const Duration(seconds: 11));
+        await tester.pumpAndSettle();
+        await tester.pump(const Duration(minutes: 2, seconds: 11));
+        await tester.pumpAndSettle();
+
+        expect(AuthService.getCreds(capturedCtx), isNull);
+        await AuthService.requestLogin(capturedCtx);
+        await tester.pumpAndSettle();
+
+        expect(loginCalls, 1);
+        expect(AuthService.getCreds(capturedCtx), same(replacement));
+      },
+    );
+  });
 } // end main

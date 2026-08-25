@@ -164,12 +164,17 @@ class AuthService extends StatefulWidget {
   @visibleForTesting
   final http.Client? httpClient;
 
+  /// Overrides the browser/native login flow. Only set this in tests.
+  @visibleForTesting
+  final Future<Credential> Function(Client client)? authenticateForTest;
+
   const AuthService({
     required this.authInfo,
     required this.child,
     super.key,
     this.oidClient,
     this.httpClient,
+    this.authenticateForTest,
   });
 
   @override
@@ -233,6 +238,10 @@ class _AuthState extends State<AuthService> {
   // Background renewal timer — cancelled on logout / dispose.
   Timer? _renewalTimer;
 
+  // Reused for all renewal requests and closed on dispose when state created it.
+  late final http.Client _renewalHttpClient;
+  bool _ownsRenewalHttpClient = false;
+
   // Monotonically increasing counter. Incremented on every logout so that
   // any in-flight _renewToken() call can detect that the session it was
   // renewing is no longer active and discard its result.
@@ -249,12 +258,21 @@ class _AuthState extends State<AuthService> {
   @override
   void initState() {
     super.initState();
+    final injectedHttpClient = widget.httpClient;
+    if (injectedHttpClient != null) {
+      _renewalHttpClient = injectedHttpClient;
+    } else {
+      _renewalHttpClient = http.Client();
+      _ownsRenewalHttpClient = true;
+    }
     _initialize();
   }
 
   @override
   void dispose() {
+    _sessionGeneration++;
     _renewalTimer?.cancel();
+    if (_ownsRenewalHttpClient) _renewalHttpClient.close();
     super.dispose();
   }
 
@@ -441,7 +459,7 @@ class _AuthState extends State<AuthService> {
 
     final client = await _ensureClient();
 
-    if (client == null) return;
+    if (client == null || _sessionGeneration != generation) return;
 
     final tokenEndpoint = client.issuer.metadata.tokenEndpoint;
 
@@ -453,8 +471,7 @@ class _AuthState extends State<AuthService> {
     dev.log('renewing token in background', name: 'auth');
 
     try {
-      final httpClient = widget.httpClient ?? http.Client();
-      final response = await httpClient.post(
+      final response = await _renewalHttpClient.post(
         tokenEndpoint,
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
         body: {
@@ -479,15 +496,47 @@ class _AuthState extends State<AuthService> {
 
       final Map<String, dynamic> body = (jsonDecode(response.body) as Map)
           .cast<String, dynamic>();
+      final accessToken = body['access_token'];
+      if (accessToken is! String || accessToken.isEmpty) {
+        throw const FormatException(
+          'Token renewal response has no access_token',
+        );
+      }
+
+      final rawExpiresIn = body['expires_in'];
+      final expiresInSeconds = switch (rawExpiresIn) {
+        null => null,
+        num value when value >= 0 => value.toInt(),
+        String value => int.tryParse(value),
+        _ => null,
+      };
+      if (rawExpiresIn != null && expiresInSeconds == null) {
+        throw const FormatException(
+          'Token renewal response has invalid expires_in',
+        );
+      }
+
+      final oldIdToken = cred.response?['id_token'];
+      final idToken = body['id_token'] is String
+          ? body['id_token'] as String
+          : oldIdToken is String
+          ? oldIdToken
+          : null;
+      final returnedRefreshToken = body['refresh_token'];
+      if (returnedRefreshToken != null && returnedRefreshToken is! String) {
+        throw const FormatException(
+          'Token renewal response has invalid refresh_token',
+        );
+      }
 
       final newCred = client.createCredential(
-        accessToken: body['access_token'] as String? ?? '',
-        idToken: body['id_token'] as String?,
-        refreshToken: body['refresh_token'] as String? ?? refreshToken,
+        accessToken: accessToken,
+        idToken: idToken,
+        refreshToken: returnedRefreshToken as String? ?? refreshToken,
         tokenType: body['token_type'] as String? ?? 'Bearer',
-        expiresIn: body['expires_in'] is num
-            ? Duration(seconds: (body['expires_in'] as num).toInt())
-            : null,
+        expiresIn: expiresInSeconds == null
+            ? null
+            : Duration(seconds: expiresInSeconds),
       );
 
       oid.saveCredential(newCred, audience: _info.audience, scopes: _scopes);
@@ -582,7 +631,9 @@ class _AuthState extends State<AuthService> {
     }
 
     try {
-      final creds = await oid.authenticate(client, scopes: _scopes);
+      final creds =
+          await (widget.authenticateForTest?.call(client) ??
+              oid.authenticate(client, scopes: _scopes));
       if (!mounted) return;
       oid.saveCredential(creds, audience: _info.audience, scopes: _scopes);
       setState(() => _setCredential(creds, showToast: true));
