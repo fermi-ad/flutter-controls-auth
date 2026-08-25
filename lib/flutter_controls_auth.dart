@@ -242,10 +242,10 @@ class _AuthState extends State<AuthService> {
   late final http.Client _renewalHttpClient;
   bool _ownsRenewalHttpClient = false;
 
-  // Monotonically increasing counter. Incremented on every logout so that
-  // any in-flight _renewToken() call can detect that the session it was
-  // renewing is no longer active and discard its result.
-  int _sessionGeneration = 0;
+  // Version of the currently active authentication session. This is an
+  // invalidation token, not a count of logins: changing it makes async work
+  // started for the previous session stale.
+  int _authSessionVersion = 0;
 
   AuthInfo get _info => widget.authInfo;
 
@@ -270,7 +270,7 @@ class _AuthState extends State<AuthService> {
 
   @override
   void dispose() {
-    _sessionGeneration++;
+    _authSessionVersion++;
     _renewalTimer?.cancel();
     if (_ownsRenewalHttpClient) _renewalHttpClient.close();
     super.dispose();
@@ -398,8 +398,8 @@ class _AuthState extends State<AuthService> {
 
   // Clears credential state together. Must be called inside setState().
   void _clearCredential() {
-    // Bump the generation so any in-flight _renewToken() discards its result.
-    _sessionGeneration++;
+    // Invalidate async work associated with the cleared session.
+    _authSessionVersion++;
     _renewalTimer?.cancel();
     _renewalTimer = null;
     _credential = null;
@@ -446,9 +446,10 @@ class _AuthState extends State<AuthService> {
   // On failure the credential is left in place until it expires, at which
   // point it is cleared so that requestLogin() can recover.
   Future<void> _renewToken(Credential cred) async {
-    // Capture the session generation before any await so we can detect a
-    // logout that occurs while the HTTP request is in flight.
-    final generation = _sessionGeneration;
+    // Capture the session version before any await. If it changes while this
+    // renewal is in flight, the response belongs to an old authentication
+    // session and must be discarded.
+    final renewalSessionVersion = _authSessionVersion;
 
     final refreshToken = cred.response?['refresh_token'] as String?;
 
@@ -459,7 +460,10 @@ class _AuthState extends State<AuthService> {
 
     final client = await _ensureClient();
 
-    if (client == null || _sessionGeneration != generation) return;
+    // A mismatch means this renewal outlived the auth state it started for.
+    if (client == null || _authSessionVersion != renewalSessionVersion) {
+      return;
+    }
 
     final tokenEndpoint = client.issuer.metadata.tokenEndpoint;
 
@@ -483,14 +487,16 @@ class _AuthState extends State<AuthService> {
 
       // If the session was invalidated (logout) while we were waiting, discard
       // the response entirely — do not restore credentials or touch storage.
-      if (_sessionGeneration != generation) return;
+      if (_authSessionVersion != renewalSessionVersion) return;
 
       if (response.statusCode != 200) {
         dev.log(
           'token renewal failed: HTTP ${response.statusCode}',
           name: 'auth',
         );
-        if (mounted) _handleRenewalFailure(cred, generation);
+        if (mounted) {
+          _handleRenewalFailure(cred, renewalSessionVersion);
+        }
         return;
       }
 
@@ -555,18 +561,18 @@ class _AuthState extends State<AuthService> {
       dev.log('token renewed successfully', name: 'auth');
     } catch (e) {
       dev.log('token renewal error: $e', name: 'auth');
-      if (mounted && _sessionGeneration == generation) {
-        _handleRenewalFailure(cred, generation);
+      if (mounted && _authSessionVersion == renewalSessionVersion) {
+        _handleRenewalFailure(cred, renewalSessionVersion);
       }
     }
   }
 
   // Shows the renewal-error toast and schedules a post-expiry timer that
   // clears the (now-stale) credential so requestLogin() can recover.
-  // [generation] must be the session generation captured before the HTTP
-  // request so that a subsequent logout or successful renewal cancels the
-  // clear timer.
-  void _handleRenewalFailure(Credential cred, int generation) {
+  // [sessionVersion] must be the authentication-session version captured
+  // before the HTTP request so that a subsequent logout or successful renewal
+  // cancels the clear timer.
+  void _handleRenewalFailure(Credential cred, int sessionVersion) {
     final jwt = cred.response?['access_token'] as String?;
     final expiry = _jwtExpiry(jwt);
 
@@ -579,7 +585,7 @@ class _AuthState extends State<AuthService> {
     // Schedule a clear at (or immediately after) token expiry so the widget
     // stops reporting the user as authenticated once the token is unusable.
     Timer(delay > Duration.zero ? delay : Duration.zero, () {
-      if (!mounted || _sessionGeneration != generation) return;
+      if (!mounted || _authSessionVersion != sessionVersion) return;
       setState(_clearCredential);
     });
   }
