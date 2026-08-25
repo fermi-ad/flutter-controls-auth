@@ -4,10 +4,12 @@
 /// widgets and types are used by our other packages.
 library;
 
+import 'dart:async';
 import 'dart:convert';
 import 'dart:developer' as dev;
 
 import 'package:flutter/material.dart';
+import 'package:http/http.dart' as http;
 import 'package:openid_client/openid_client.dart';
 import 'package:toastification/toastification.dart' show toastification;
 import 'src/openid_browser.dart'
@@ -48,6 +50,25 @@ String _base64UrlDecode(String base64Url) {
   }
 
   return utf8.decode(base64Decode(normalized));
+}
+
+// Parses the `exp` claim from a JWT access token and returns the expiry as a
+// [DateTime]. Returns `null` if the token is absent, malformed, or has no
+// `exp` claim.
+DateTime? _jwtExpiry(String? jwt) {
+  try {
+    if (jwt?.split('.') case [_, final payload, _]) {
+      final dec = jsonDecode(_base64UrlDecode(payload));
+
+      if (dec case {'exp': final num exp}) {
+        return DateTime.fromMillisecondsSinceEpoch(
+          (exp * 1000).toInt(),
+          isUtc: true,
+        );
+      }
+    }
+  } catch (_) {}
+  return null;
 }
 
 // Extracts the roles from the JWT. Although the application has access to the
@@ -131,7 +152,30 @@ class AuthService extends StatefulWidget {
   final AuthInfo authInfo;
   final Widget child;
 
-  const AuthService({required this.authInfo, required this.child, super.key});
+  /// Overrides the OpenID [Client] used for token operations. Only set this
+  /// in tests — production code always passes `null` so that [_AuthState]
+  /// performs real [Issuer.discover()] on first use.
+  @visibleForTesting
+  final Client? oidClient;
+
+  /// Overrides the [http.Client] used for token-endpoint requests. Only set
+  /// this in tests — production code always passes `null` so that
+  /// [_AuthState] uses the default [http.Client].
+  @visibleForTesting
+  final http.Client? httpClient;
+
+  /// Overrides the browser/native login flow. Only set this in tests.
+  @visibleForTesting
+  final Future<Credential> Function(Client client)? authenticateForTest;
+
+  const AuthService({
+    required this.authInfo,
+    required this.child,
+    super.key,
+    this.oidClient,
+    this.httpClient,
+    this.authenticateForTest,
+  });
 
   @override
   State<AuthService> createState() => _AuthState();
@@ -158,6 +202,11 @@ class AuthService extends StatefulWidget {
   static UserInfo? getUserInfo(BuildContext context) =>
       context.dependOnInheritedWidgetOfExactType<_AuthCredentials>()?.userInfo;
 
+  /// Returns the expiry time of the JWT access token, or `null` if the user
+  /// is not logged in, the token is absent, or the token has no `exp` claim.
+  static DateTime? getJwtExpiry(BuildContext context) =>
+      _jwtExpiry(getJwt(context));
+
   static Future<void> requestLogin(BuildContext context) async =>
       await context.findAncestorStateOfType<_AuthState>()?.requestLogin();
 
@@ -172,6 +221,9 @@ class _AuthState extends State<AuthService> {
 
   static const List<String> _scopes = ['roles'];
 
+  // How far before token expiry to fire the renewal timer.
+  static const _renewalLeadTime = Duration(minutes: 2);
+
   Credential? _credential;
   UserInfo? _userInfo;
 
@@ -182,6 +234,18 @@ class _AuthState extends State<AuthService> {
   // Lazily set on first successful Issuer.discover(); reused for all
   // subsequent login attempts.
   Client? _client;
+
+  // Background renewal timer — cancelled on logout / dispose.
+  Timer? _renewalTimer;
+
+  // Reused for all renewal requests and closed on dispose when state created it.
+  late final http.Client _renewalHttpClient;
+  bool _ownsRenewalHttpClient = false;
+
+  // Version of the currently active authentication session. This is an
+  // invalidation token, not a count of logins: changing it makes async work
+  // started for the previous session stale.
+  int _authSessionVersion = 0;
 
   AuthInfo get _info => widget.authInfo;
 
@@ -194,7 +258,22 @@ class _AuthState extends State<AuthService> {
   @override
   void initState() {
     super.initState();
+    final injectedHttpClient = widget.httpClient;
+    if (injectedHttpClient != null) {
+      _renewalHttpClient = injectedHttpClient;
+    } else {
+      _renewalHttpClient = http.Client();
+      _ownsRenewalHttpClient = true;
+    }
     _initialize();
+  }
+
+  @override
+  void dispose() {
+    _authSessionVersion++;
+    _renewalTimer?.cancel();
+    if (_ownsRenewalHttpClient) _renewalHttpClient.close();
+    super.dispose();
   }
 
   // Runs at startup with zero network calls unless a redirect code is present.
@@ -231,7 +310,7 @@ class _AuthState extends State<AuthService> {
           audience: _info.audience,
           scopes: _scopes,
         );
-        setState(() => _setCredential(redirectCred));
+        setState(() => _setCredential(redirectCred, showToast: true));
       }
     } catch (e) {
       dev.log('redirect token exchange failed: $e', name: 'auth');
@@ -243,6 +322,8 @@ class _AuthState extends State<AuthService> {
   /// Returns the client on success, or `null` if discovery fails (in which
   /// case an error toast has already been shown).
   Future<Client?> _ensureClient() async {
+    // Allow tests to inject a pre-built Client, bypassing network discovery.
+    if (widget.oidClient != null) return _client = widget.oidClient;
     if (_client != null) return _client;
 
     final uri = Uri.parse('https://ad-auth.fnal.gov/realms/${_info.realm}/');
@@ -260,10 +341,10 @@ class _AuthState extends State<AuthService> {
   }
 
   void _showAuthError(Object e) {
-    // Schedule the toast after the current build frame completes.
-    // Dismiss any queued toasts first so the error isn't buried.
-    // scheduleFrame() is required on desktop: Flutter won't render a new frame
-    // without user input when idle, so the postFrameCallback would never fire.
+    // Schedule the toast after the current build frame completes. Dismiss any
+    // queued toasts first so the error isn't buried. scheduleFrame() is
+    // required on desktop: Flutter won't render a new frame without user input
+    // when idle, so the postFrameCallback would never fire.
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (mounted) {
         toastification.dismissAll(delayForAnimation: false);
@@ -280,35 +361,252 @@ class _AuthState extends State<AuthService> {
   }
 
   // Sets _credential, _userInfo, and _roles together so they're always in sync.
-  // Must be called inside setState(). Shows the "logged in" toast once.
-  void _setCredential(Credential cred) {
+  // Must be called inside setState(). Pass [showToast] = true only on an
+  // explicit user-initiated login — silent background renewals should not
+  // re-announce the user.
+  void _setCredential(Credential cred, {bool showToast = false}) {
     _credential = cred;
     _userInfo = _tryExtractUserInfo(cred);
     _roles = _extractRolesFromJwt(
       cred.response?['access_token'] as String?,
       _info.clientId,
     );
+    _scheduleRenewal(cred);
 
-    // Show the login toast after the frame that triggered this setState().
-    // scheduleFrame() is required on desktop: Flutter won't render a new frame
-    // without user input when idle, so the postFrameCallback would never fire.
+    if (showToast) {
+      // Show the login toast after the frame that triggered this setState().
+      // scheduleFrame() is required on desktop: Flutter won't render a new
+      // frame without user input when idle, so the postFrameCallback would
+      // never fire.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted && _userInfo != null) {
+          infoBox(
+            context,
+            'Notice',
+            'You are logged in as ${_userInfo!.name ?? "UNKNOWN"}.',
+          );
+        }
+      });
+      WidgetsBinding.instance.scheduleFrame();
+    }
+  }
+
+  /// Seeds the widget with [cred] as if the user had just logged in.
+  /// Only call this from tests — it bypasses the normal login flow.
+  @visibleForTesting
+  void setCredentialForTest(Credential cred) => _setCredential(cred);
+
+  // Clears credential state together. Must be called inside setState().
+  void _clearCredential() {
+    // Invalidate async work associated with the cleared session.
+    _authSessionVersion++;
+    _renewalTimer?.cancel();
+    _renewalTimer = null;
+    _credential = null;
+    _userInfo = null;
+    _roles = const {};
+  }
+
+  // ---------------------------------------------------------------------------
+  // Token renewal
+  // ---------------------------------------------------------------------------
+
+  // Arms (or re-arms) the background renewal timer based on the access token's
+  // `exp` claim. Fires [_renewalLeadTime] before expiry. If the token has no
+  // `exp` claim, or expiry is already past (or too close), the timer is not
+  // set — the user will simply need to log in again.
+  void _scheduleRenewal(Credential cred) {
+    _renewalTimer?.cancel();
+    _renewalTimer = null;
+
+    final jwt = cred.response?['access_token'] as String?;
+    final expiry = _jwtExpiry(jwt);
+
+    if (expiry == null) return;
+
+    final fireAt = expiry.subtract(_renewalLeadTime);
+    final delay = fireAt.difference(DateTime.now().toUtc());
+
+    if (delay <= Duration.zero) {
+      // Token is already expired or too close to expiry — attempt renewal now.
+      _renewToken(cred);
+    } else {
+      dev.log(
+        'renewal scheduled in ${delay.inSeconds}s '
+        '(token expires at ${expiry.toIso8601String()})',
+        name: 'auth',
+      );
+
+      _renewalTimer = Timer(delay, () => _renewToken(cred));
+    }
+  }
+
+  // Exchanges the refresh token for a new access token via Keycloak's token
+  // endpoint. On success the new credential is persisted and state is updated.
+  // On failure the credential is left in place until it expires, at which
+  // point it is cleared so that requestLogin() can recover.
+  Future<void> _renewToken(Credential cred) async {
+    // Capture the session version before any await. If it changes while this
+    // renewal is in flight, the response belongs to an old authentication
+    // session and must be discarded.
+    final renewalSessionVersion = _authSessionVersion;
+
+    final refreshToken = cred.response?['refresh_token'] as String?;
+
+    if (refreshToken == null) {
+      dev.log('no refresh token available — skipping renewal', name: 'auth');
+      return;
+    }
+
+    final client = await _ensureClient();
+
+    // A mismatch means this renewal outlived the auth state it started for.
+    if (client == null || _authSessionVersion != renewalSessionVersion) {
+      return;
+    }
+
+    final tokenEndpoint = client.issuer.metadata.tokenEndpoint;
+
+    if (tokenEndpoint == null) {
+      dev.log('token endpoint not available — skipping renewal', name: 'auth');
+      return;
+    }
+
+    dev.log('renewing token in background', name: 'auth');
+
+    try {
+      final response = await _renewalHttpClient.post(
+        tokenEndpoint,
+        headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+        body: {
+          'grant_type': 'refresh_token',
+          'client_id': _info.clientId,
+          'refresh_token': refreshToken,
+        },
+      );
+
+      // If the session was invalidated (logout) while we were waiting, discard
+      // the response entirely — do not restore credentials or touch storage.
+      if (_authSessionVersion != renewalSessionVersion) return;
+
+      if (response.statusCode != 200) {
+        dev.log(
+          'token renewal failed: HTTP ${response.statusCode}',
+          name: 'auth',
+        );
+        if (mounted) {
+          _handleRenewalFailure(cred, renewalSessionVersion);
+        }
+        return;
+      }
+
+      final Map<String, dynamic> body = (jsonDecode(response.body) as Map)
+          .cast<String, dynamic>();
+
+      // Validate the complete provider payload before constructing or saving a
+      // credential. A 200 response can still be malformed and must not replace
+      // the last usable credential with partial or unusable state.
+      final accessToken = body['access_token'];
+      if (accessToken is! String || accessToken.isEmpty) {
+        throw const FormatException(
+          'Token renewal response has no access_token',
+        );
+      }
+
+      final rawExpiresIn = body['expires_in'];
+      final expiresInSeconds = switch (rawExpiresIn) {
+        null => null,
+        num value when value >= 0 => value.toInt(),
+        String value => int.tryParse(value),
+        _ => null,
+      };
+      if (rawExpiresIn != null && expiresInSeconds == null) {
+        throw const FormatException(
+          'Token renewal response has invalid expires_in',
+        );
+      }
+
+      // Some providers omit id_token during a refresh. Keep the previous one
+      // so relying parties do not lose identity claims on an otherwise valid
+      // access-token renewal.
+      final oldIdToken = cred.response?['id_token'];
+      final idToken = body['id_token'] is String
+          ? body['id_token'] as String
+          : oldIdToken is String
+          ? oldIdToken
+          : null;
+      final returnedRefreshToken = body['refresh_token'];
+      if (returnedRefreshToken != null && returnedRefreshToken is! String) {
+        throw const FormatException(
+          'Token renewal response has invalid refresh_token',
+        );
+      }
+
+      final newCred = client.createCredential(
+        accessToken: accessToken,
+        idToken: idToken,
+        refreshToken: returnedRefreshToken as String? ?? refreshToken,
+        tokenType: body['token_type'] as String? ?? 'Bearer',
+        expiresIn: expiresInSeconds == null
+            ? null
+            : Duration(seconds: expiresInSeconds),
+      );
+
+      oid.saveCredential(newCred, audience: _info.audience, scopes: _scopes);
+
+      if (!mounted) return;
+
+      setState(() => _setCredential(newCred));
+
+      dev.log('token renewed successfully', name: 'auth');
+    } catch (e) {
+      dev.log('token renewal error: $e', name: 'auth');
+      if (mounted && _authSessionVersion == renewalSessionVersion) {
+        _handleRenewalFailure(cred, renewalSessionVersion);
+      }
+    }
+  }
+
+  // Shows the renewal-error toast and schedules a post-expiry timer that
+  // clears the (now-stale) credential so requestLogin() can recover.
+  // [sessionVersion] must be the authentication-session version captured
+  // before the HTTP request so that a subsequent logout or successful renewal
+  // cancels the clear timer.
+  void _handleRenewalFailure(Credential cred, int sessionVersion) {
+    final jwt = cred.response?['access_token'] as String?;
+    final expiry = _jwtExpiry(jwt);
+
+    _showRenewalError(expiry);
+
+    final delay = expiry != null
+        ? expiry.difference(DateTime.now().toUtc())
+        : Duration.zero;
+
+    // Schedule a clear at (or immediately after) token expiry so the widget
+    // stops reporting the user as authenticated once the token is unusable.
+    Timer(delay > Duration.zero ? delay : Duration.zero, () {
+      if (!mounted || _authSessionVersion != sessionVersion) return;
+      setState(_clearCredential);
+    });
+  }
+
+  void _showRenewalError(DateTime? expiry) {
+    final expiryMsg = expiry != null
+        ? 'Current token expires at ${expiry.toLocal()}.'
+        : 'Current token expiry is unknown.';
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (mounted && _userInfo != null) {
-        infoBox(
+      if (mounted) {
+        toastification.dismissAll(delayForAnimation: false);
+        errorBox(
           context,
-          'Notice',
-          'You are logged in as ${_userInfo!.name ?? "UNKNOWN"}.',
+          'Token Renewal Failed',
+          'Could not renew your session. $expiryMsg',
+          duration: const Duration(seconds: 10),
         );
       }
     });
     WidgetsBinding.instance.scheduleFrame();
-  }
-
-  // Clears credential state together. Must be called inside setState().
-  void _clearCredential() {
-    _credential = null;
-    _userInfo = null;
-    _roles = const {};
   }
 
   UserInfo? _tryExtractUserInfo(Credential cred) {
@@ -341,15 +639,17 @@ class _AuthState extends State<AuthService> {
 
     if (cached != null) {
       if (!mounted) return;
-      setState(() => _setCredential(cached));
+      setState(() => _setCredential(cached, showToast: true));
       return;
     }
 
     try {
-      final creds = await oid.authenticate(client, scopes: _scopes);
+      final creds =
+          await (widget.authenticateForTest?.call(client) ??
+              oid.authenticate(client, scopes: _scopes));
       if (!mounted) return;
       oid.saveCredential(creds, audience: _info.audience, scopes: _scopes);
-      setState(() => _setCredential(creds));
+      setState(() => _setCredential(creds, showToast: true));
     } catch (e) {
       dev.log('authentication failed: $e', name: 'auth');
     }

@@ -1,6 +1,6 @@
 name: flutter_controls_auth
 description: "A new Flutter package project."
-version: 0.7.0
+version: 0.7.1
 homepage:
 
 environment:
@@ -13,6 +13,7 @@ dependencies:
 
     # Needed for KeyCloak authentication support.
 
+  http: ^1.2.0
   openid_client: ^0.4.8
   url_launcher: ^6.2.1
   web: ^1.1.1
@@ -23,6 +24,7 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
 
+  fake_async: ^1.3.1
   flutter_lints: ^6.0.0
   very_good_analysis: ^10.1.0
 
