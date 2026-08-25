@@ -496,6 +496,10 @@ class _AuthState extends State<AuthService> {
 
       final Map<String, dynamic> body = (jsonDecode(response.body) as Map)
           .cast<String, dynamic>();
+
+      // Validate the complete provider payload before constructing or saving a
+      // credential. A 200 response can still be malformed and must not replace
+      // the last usable credential with partial or unusable state.
       final accessToken = body['access_token'];
       if (accessToken is! String || accessToken.isEmpty) {
         throw const FormatException(
@@ -516,6 +520,9 @@ class _AuthState extends State<AuthService> {
         );
       }
 
+      // Some providers omit id_token during a refresh. Keep the previous one
+      // so relying parties do not lose identity claims on an otherwise valid
+      // access-token renewal.
       final oldIdToken = cred.response?['id_token'];
       final idToken = body['id_token'] is String
           ? body['id_token'] as String
