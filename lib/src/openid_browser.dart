@@ -41,12 +41,19 @@ void saveCredential(
 
 /// Loads a previously cached [Credential] from `localStorage` for the given
 /// [audience] and [scopes]. Returns `null` when no entry exists, the stored
-/// JSON is malformed, or the access token has already expired.
+/// JSON is malformed, or the access token has already expired or has less
+/// than [_minUsableWindow] remaining.
 ///
 /// Expiry is checked against the `expires_at` field (Unix seconds) written
-/// by [saveCredential]. A 30-second clock-skew buffer is applied so that a
-/// token that is about to expire is treated as expired and will be refreshed
-/// before it is actually invalid.
+/// by [saveCredential]. Tokens with less than [_minUsableWindow] remaining
+/// are removed from storage and revoked server-side (fire-and-forget) so
+/// they cannot be replayed.
+///
+/// [_minUsableWindow] matches the renewal lead time used by [_AuthState] so
+/// that a cached token is only accepted when there is enough time left to
+/// actually use it before the background renewal would fire.
+const _minUsableWindow = Duration(minutes: 2);
+
 Credential? loadCredential(
   Client client, {
   String? audience,
@@ -61,7 +68,8 @@ Credential? loadCredential(
     final Map<String, dynamic> response = (jsonDecode(raw) as Map)
         .cast<String, dynamic>();
 
-    // Reject tokens that have already expired (with a 30-second buffer).
+    // Reject tokens with less than _minUsableWindow remaining. Build the
+    // credential first so we can revoke it before discarding.
     final expiresAt = response['expires_at'];
 
     if (expiresAt is num) {
@@ -69,10 +77,18 @@ Credential? loadCredential(
         (expiresAt * 1000).toInt(),
       );
 
-      if (DateTime.now().isAfter(
-        expiry.subtract(const Duration(seconds: 30)),
-      )) {
+      if (DateTime.now().isAfter(expiry.subtract(_minUsableWindow))) {
         window.localStorage.removeItem(key);
+        // Revoke the stale token server-side (fire-and-forget).
+        client
+            .createCredential(
+              accessToken: response['access_token'] as String? ?? '',
+              idToken: response['id_token'] as String?,
+              refreshToken: response['refresh_token'] as String?,
+              tokenType: response['token_type'] as String? ?? 'Bearer',
+            )
+            .revoke()
+            .ignore();
         return null;
       }
     }

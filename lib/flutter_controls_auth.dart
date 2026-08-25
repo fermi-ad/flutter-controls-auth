@@ -428,8 +428,9 @@ class _AuthState extends State<AuthService> {
     final delay = fireAt.difference(DateTime.now().toUtc());
 
     if (delay <= Duration.zero) {
-      // Token is already expired or too close to expiry — attempt renewal now.
-      _renewToken(cred);
+      // Token is already expired or too close to expiry — the user will need
+      // to log in again when the token is rejected.
+      return;
     } else {
       dev.log(
         'renewal scheduled in ${delay.inSeconds}s '
