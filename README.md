@@ -12,14 +12,15 @@ required roles.
 
 ## Getting started
 
-The latest branch is `0.x`. To track the latest features, add this to your
+The default branch is `main`. To track the latest features, add this to your
 `pubspec.yaml` file:
 
 ```yaml
 dependencies:
   git:
     url: https://github.com/fermi-ad/flutter-controls-auth.git
-    ref: 0.x
+    tag_pattern: v{{version}}
+  version: ^0.8.0
 ```
 
 ## Usage
