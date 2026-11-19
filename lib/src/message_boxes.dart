@@ -12,25 +12,16 @@ void _showBox(
   String content,
   Duration? duration,
 ) {
-  final theme = Theme.of(context);
-  final textTheme = theme.textTheme;
+  final colors = Theme.of(context).colorScheme;
 
   toastification.show(
     context: context,
     type: type,
     style: .minimal,
-    title: Text(
-      title,
-      style: textTheme.titleSmall!.copyWith(
-        color: theme.colorScheme.onInverseSurface,
-      ),
-    ),
-    description: Text(
-      content,
-      style: textTheme.bodyMedium!.copyWith(
-        color: theme.colorScheme.onInverseSurface,
-      ),
-    ),
+    backgroundColor: colors.surface,
+    foregroundColor: colors.onSurface,
+    title: Text(title),
+    description: Text(content),
     autoCloseDuration: duration,
   );
 }
